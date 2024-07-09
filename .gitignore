@@ -1,2 +1,5 @@
 figs*
 *pycache*
+old/*
+inputs/*
+chained.sh
