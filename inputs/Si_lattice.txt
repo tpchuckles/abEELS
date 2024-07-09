@@ -1,0 +1,26 @@
+# MD INPUTS AND RUN PARAMETERS
+path="../../../MD/projects/Si_SED_09/"
+dumpfile="NVE.qdump" ; useLattice="positions.pos"
+atomTypes=["Si"]
+nx,ny,nz=25,25,5	# how many unit cells in x,y,z
+a,b,c=5.43729,5.43729,5.43729 # unit cell definition, Å,°
+dt=0.002*10		# timestep (picoseconds) times sampling rate (every nth step)
+
+# GEOMETRY POST-PROCESSING
+trim=[[13,22],[13,22],[]] # add two values (unit cell counts) to any dimension to trim to that size
+tiling=[1,1,1]	# expanding the simulation in direction parallel to beam will lead to artifacts in reciprical space
+beamAxis=2	# abtem default is to look down z axis. we'll rotate the sim if you specify 0 or 1
+flipBeam=False	# default is to look from +z towards -z, but we can mirror the simulation too (e.g. if we're more sensitivity to top layers)
+
+# ABTEM PARAMETERS
+CONVERGENCE=5
+layerwise=0	# every nth. set to 0 for no depth-dependence
+numFP=50 ; parallelFP=True ; offsetFP=0 
+maxrad=100 # how far out in diffraction space to store the exit wave
+Emax=20 ; Ebins=20 # max energy in THz (note: your dt parameter above under "MD inputs and run parameters" is critical for this to be correct)
+
+# EXPECTED OUTPUT FILE SIZES: 
+# one psi for one atomic configuration for one slice for 150mrad diffangle = 25.9MB. 100 FP configs 8 slices 50 energies = 1TB
+# (confirmation: for AlN_01b.txt, numFP=2, layerwise yielded 6 layers, 50 energies = 15.15GB of psi files)
+# 100mrad will be 45% the size (100^2/150^2), numFP=50, 8 slices, 50 energies seems good = 227 GB. each psi file will be 4.55 GB
+# numFP=10 (since we already have so many included with stacking?) it's 22.7 GB total and 466 MB per file

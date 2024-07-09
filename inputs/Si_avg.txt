@@ -1,0 +1,25 @@
+# MD INPUTS AND RUN PARAMETERS
+path="../../../MD/projects/Si_SED_10/"
+# dumpfile="NVE.qdump"
+dumpfile="positions.pos" ; dumptype="positions"
+atomTypes=["Si"]
+nx,ny,nz=25,25,5	# how many unit cells in x,y,z
+a,b,c=5.43729,5.43729,5.43729 # unit cell definition, Å,°
+dt=0.002*10		# timestep (picoseconds) times sampling rate (every nth step)
+
+# GEOMETRY POST-PROCESSING
+trim=[[9.1,15.9],[9.1,15.9],[]] # add two values (unit cell counts) to any dimension to trim to that size
+tiling=[1,1,1]	# expanding the simulation in direction parallel to beam will lead to artifacts in reciprical space
+beamAxis=2	# abtem default is to look down z axis. we'll rotate the sim if you specify 0 or 1
+flipBeam=False	# default is to look from +z towards -z, but we can mirror the simulation too (e.g. if we're more sensitivity to top layers)
+
+# ABTEM PARAMETERS
+CONVERGENCE=5
+layerwise=0	# every nth. set to 0 for no depth-dependence
+numFP=16 ; parallelFP=False ; offsetFP=0 
+maxrad=100 # how far out in diffraction space to store the exit wave
+Emax=20 ; Ebins=2 # max energy in THz (note: your dt parameter above under "MD inputs and run parameters" is critical for this to be correct)
+
+addModes={'A': [0.1, 0.1], 'w': [0, 0], 'k': [0.9244583691036653, 0.9244583691036653], 'pdirec': [[1, 1, 0], [1, 1, 0]], 'vdirec': [[1, 1, 0], [-1, 1, 0]], 'phase_rel': [0, 1.5707963267948966], 'phase': [5.890486225480862, 7.461282552275758]}# (confirmation: for AlN_01b.txt, numFP=2, layerwise yielded 6 layers, 50 energies = 15.15GB of psi files)
+# 100mrad will be 45% the size (100^2/150^2), numFP=50, 8 slices, 50 energies seems good = 227 GB. each psi file will be 4.55 GB
+# numFP=10 (since we already have so many included with stacking?) it's 22.7 GB total and 466 MB per file
