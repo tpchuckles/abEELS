@@ -51,13 +51,16 @@ def readInputFile(infile):
 	# READ IN THE FOLLOWING VARIABLES FROM THE INPUT FILE
 	# path,dumpfile,atomTypes,nx,ny,nz,a,b,c,dt,trim,beamAxis,flipBeam,tiling,CONVERGENCE
 	# Note no skewed primitive cells are currently supported for tiling
-	global path,dumpfile,dumptype,atomTypes,nx,ny,nz,a,b,c,dt,trim,beamAxis,flipBeam,tile,CONVERGENCE,outDirec,probePositions,useLattice
-	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl,saveExitWave,restartFrom,restartDirec,addModes
+	global path, dumpfile, dumptype, useLattice, atomTypes, nx, ny, nz, a, b, c ,dt, trim, beamAxis, flipBeam, tile
+	global CONVERGENCE, outDirec, probePositions, saveExitWave, restartFrom, restartDirec, addModes, modifyProbe
+	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl
 	kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl=[],[],[],[],[],[],[],[]
-	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False
+	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False ; modifyProbe=False
 	saveExitWave=False ; restartFrom=False
 	lines=open(infile,'r').readlines()
 	exec("".join(lines),globals())
+	kmask_lbl=kmask_lbl+[ str(v) for v in range(len(kmask_xis)+len(kmask_cxs)-len(kmask_lbl)) ]
+	print(kmask_lbl)
 	outDirec="figs_abEELS_"+infile.strip("/").split("/")[-1].split(".")[0]
 	if restartFrom:
 		restartDirec="figs_abEELS_"+restartFrom ; RD=restartDirec
@@ -195,6 +198,7 @@ def preprocessPositions():
 		print("TRIM:",ijk,xi,xf)
 		mask=np.zeros(len(xs))
 		mask[xs>=xi]=1 ; mask[xs>=xf]=0
+		#mask[xs>=xi]=1 ; mask[xs>=xi+2]=0 ; mask[xs>=xf-2]=1 ; mask[xs>=xf]=0 # CUSTOM MASK MOD TO CLEAR OUT ATOMS SO WE CAN VISUALIZE THE PROBE
 		avg=avg[mask==1,:] ; disp=disp[:,mask==1,:] ; velocities=velocities[:,mask==1,:] ; types=types[mask==1]
 		avg[:,ijk]-=xi
 		if ijk==0:
@@ -389,16 +393,16 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 	# STEP 1.b CREATE POTENTIAL
 	print("setting up wave sim")
 	box=np.asarray(atomStack[0].cell).flat[::4] ; print("cell size: ",box)
-	potential_phonon = abtem.Potential(frozen_phonons, sampling=.05)
+	potential_phonon = abtem.Potential(frozen_phonons, sampling=.05)#,slice_thickness=.01) # default slice thickness is 1Å
 	nLayers=1
 	if layerwise!=0:
-		nslices=potential_phonon.num_slices # 14.5 A --> potential divided into 33 layers
+		nslices=potential_phonon.num_slices # 14.5 Å --> potential divided into 33 layers
 		nth=nslices//layerwise # 33 layers, user asked for 10? 33//10 --> every 3rd layer --> 11 layers total. 
 		nth=max(nth,1)		# user asked for 1000? 33//1000 --> 0! oops! just give them every layer instead. 
-		potential_phonon = abtem.Potential(frozen_phonons, sampling=.05,exit_planes=nth)
+		potential_phonon = abtem.Potential(frozen_phonons, sampling=.05,exit_planes=nth)#,slice_thickness=.01) # default slice thickness is 1Å
 		nLayers=potential_phonon.num_exit_planes
 		print("potential sliced into",nslices,"slices. keeping every",nth,"th layer, we'll have",nLayers,"exit waves")
-		with open(outDirec+"/nLayers.txt") as f:
+		with open(outDirec+"/nLayers.txt",'w') as f:
 			f.write(str(nLayers))
 		# abtem/potentials/iam.py > class Potential() states: 
 		# exit_planes : If 'exit_planes' is an integer a measurement will be collected every 'exit_planes' number of slices.
@@ -425,6 +429,7 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 		probe = abtem.Probe(energy=100e3, semiangle_cutoff=CONVERGENCE) # semiangle_cutoff is the convergence angle
 		probe.grid.match(potential_phonon)
 		print(probe.gpts)
+
 		if plotOut:
 			print("preview probe")
 			probe.show() ; plt.savefig(outDirec+"/probe.png")
@@ -436,6 +441,17 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 			custom_scan=abtem.CustomScan([box[0]/2, box[1]/2])
 		print("scan positions:",custom_scan.get_positions())
 		npts=len(custom_scan.get_positions())
+
+		if modifyProbe: # your input file can define a function which does an in-plane modify of the complex probe function! 
+			probewave=probe.build(custom_scan).compute()
+			Z=probewave.array ; nx,ny=np.shape(Z)
+			LX,LY=probe.extent
+			xs=np.linspace(-LX/2,LX/2,nx) ; ys=np.linspace(-LY/2,LY/2,ny)
+			modifyProbe(Z,xs,ys)
+			contour(np.real(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png")
+			contour(np.imag(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png")
+
+
 	else: # PLANE WAVE INSTEAD OF CONVERGENT PROBE (just define the plane wave params)
 		plane_wave = abtem.PlaneWave(energy=100e3, sampling=0.05)
 
@@ -461,9 +477,11 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 			meta=[abtem.core.axes.FrozenPhononsAxis(meta)]
 			exit_waves=abtem.waves.Waves(ewave,  energy=100e3, sampling=.05, reciprocal_space=False,ensemble_axes_metadata=meta)
 			entrance_waves.grid.match(potential_phonon) 
-
 	elif CONVERGENCE!=0:
-		exit_waves = probe.multislice(potential_phonon,scan=custom_scan).compute()
+		if modifyProbe:
+			exit_waves = probewave.multislice(potential_phonon).compute()
+		else:
+			exit_waves = probe.multislice(potential_phonon,scan=custom_scan).compute()
 	else:
 		exit_waves = plane_wave.multislice(potential_phonon).compute()
 	print("(took",time.time()-start,"s)")
@@ -587,6 +605,9 @@ def energyLoss(psi,plotOut=False,mask=None):
 	cohe=np.absolute(sumpsi)**2
 	Ivib=inco-cohe
 
+	kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
+	contour(np.log(cohe).T,kxs,kys,filename=outDirec+"/cohe_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")
+	contour(np.log(inco).T,kxs,kys,filename=outDirec+"/inco_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")
 
 	if plotOut:
 		kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
@@ -767,8 +788,7 @@ def maskDOS():
 
 	print("ASSEMBLE MASKS")
 	global kmask_lbl
-	overplot=[] ; masks=[] ; kmask_lbl=kmask_lbl+[ str(v) for v in range(len(kmask_xis)+len(kmask_cxs)-len(kmask_lbl)) ]
-	print(kmask_lbl)
+	overplot=[] ; masks=[]
 
 	for i,(xi,xf,yi,yf) in enumerate(zip(kmask_xis,kmask_xfs,kmask_yis,kmask_yfs)):
 		print("rectangular mask:",np.round(xi,4),"<= x <=",np.round(xf,4),",",np.round(yi,4),"<= y <=",np.round(yf,4))
