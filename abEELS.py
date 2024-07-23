@@ -18,6 +18,22 @@ import matplotlib.pyplot as plt
 # NEED TO TEST ALL PERMUTATIONS OF PARAMETERS:
 # CONVERGENCE (0, !0),layerwise (0,!0), parallelFP (T,F), probePositions (len==0, len!=0)
 
+# GENERAL PRINCIPLES OF OPERATION: 
+# read run parameters (readInputFile())
+# read molecular dynamics dump file (importPositions(), assumes filenames and stuff from input file. default behavior is to expect a dump file which should have atomic positions at numerous timesteps. we calculate an average position for each atom displacements from the mean. (variant 1: you can also feed your initial positions file (useLattice="filename.pos") and we'll use this instead of the average positions, with displacements from this "perfect" structure. variant 2: you can provide a file with positions only (not time-dependent) (dumpfile="filename.pos" ; dumptype="positions"). you won't get phonons, so we'll have to add them in artificially (addModes variable. see Si_cprobe input)). 
+# trimming/rotation/mirroring/stacking/tiling operations may be optionally applied, in this order. (preprocessPositions() handles trimming/rotation/mirroring, getFPconfigs() handles stacking/tiling. input file variables: trim, tiling, beamAxis, flipBeam)
+# a gaussian band-pass filter is applied to displacements (generateEnergyMasks() generates these, bandPassDisplacements() applies them)
+# an electron-wave propagation simulation is performed (ewave()). 
+# energy loss is simulated by subtracting coherent and incoherent parts from a number of frozen phonon configurations for a given energy bin (energyLoss()). this means the simulations are technically "energy resolved diffraction images" as opposed to "momentum resolved electron energy loss". no electrons lose energy within these simulations! (purely elastic electron wave propagation). 
+
+# POST PROCESSING: 
+# You may be interested in simulating the phonon density of states (eDOS()), which is simply the sum over the 
+
+#, as a function of 
+# the sum
+
+# BEGIN GENERAL FUNCTIONS
+
 def main():
 	infile=sys.argv[-1]
 	readInputFile(infile)
@@ -83,7 +99,7 @@ def readInputFile(infile):
 	shutil.copy(infile,outDirec+"/")
 
 def importPositions():
-	global positions,velocities,ts,types,avg,disp
+	global velocities,ts,types,avg,disp #,positions
 
 	# read in from custom dump file, containing positions *and* velocities
 	if dumptype=="qdump":
@@ -115,7 +131,8 @@ def importPositions():
 
 	elif dumptype=="positions":
 		pos,types=scrapePos(path+dumpfile) # qdump positions,velocities are [nt,na,3]. avg is [na,3] and disp is [nt,na,3]
-		positions=np.asarray([pos,pos]) ; velocities=np.zeros(np.shape(positions))
+		positions=np.asarray([pos,pos])
+		velocities=np.zeros(np.shape(positions))
 		disp=np.zeros(np.shape(positions)) ; avg=pos ; ts=np.asarray([0,1])
 
 	#elif dumptype=="lattice":
@@ -145,7 +162,7 @@ def importPositions():
 			print("add ",A,"*","sin(",k,"*","xyz[",p,"]","+",phi,")")
 			added=addWave(A,k,phi,p,v)
 			avg[:,:]+=added[:,:]
-			positions[:,:,:]+=added[None,:]
+			#positions[:,:,:]+=added[None,:]
 
 def addWave(A,k,phi,p_xyz,v_xyz):
 	na=len(avg)
@@ -227,38 +244,46 @@ def preprocessPositions():
 def generateEnergyMasks(fmin,fmax,numBands,bandWidth=0):
 	global dfft
 
-	# STEP 2, APPLY A FREQUENCY BAND-PASS TO DISPLACEMENTS TO ENABLE FROZEN-PHONON ABTEM SIMS IN THE SPIRIT OF ZEIGER'S FREQUENCY-ISOLATED THERMOSTAT
-	print("FFTing positions and velocities")
-	dfft=np.fft.fft(disp,axis=0) # FFT on displacements tells displacements associated with each frequency. THIS IS JUST EIGENVECTOR?
-	vfft=np.fft.fft(velocities,axis=0) # FFT on displacements tells displacements associated with each frequency. THIS IS JUST EIGENVECTOR?
-	ws=np.fft.fftfreq(len(ts),ts[1]-ts[0])
-	n=int(len(ws)/2)
-	ws/=dt # convert to THz: e.g. .002 picosecond timesteps, every 10th timestep logged
-	#print(np.shape(dfft)) # nω, na, 3
+	if numBands==1:
+		energyCenters=[0] ; masks=[np.ones(len(disp))] ; dfft=np.zeros(np.shape(disp)) ; ws=np.linspace(0,1,len(disp)) ; ddos=[1] ; vdos=[1]
+		#return energyCenters,masks
+	else:
+		# STEP 2, APPLY A FREQUENCY BAND-PASS TO DISPLACEMENTS TO ENABLE FROZEN-PHONON ABTEM SIMS IN THE SPIRIT OF ZEIGER'S FREQUENCY-ISOLATED THERMOSTAT
+		print("FFTing positions and velocities")
+		dfft=np.fft.fft(disp,axis=0) # FFT on displacements tells displacements associated with each frequency. THIS IS JUST EIGENVECTOR?
+		vfft=np.fft.fft(velocities,axis=0) # FFT on displacements tells displacements associated with each frequency. THIS IS JUST EIGENVECTOR?
+		ws=np.fft.fftfreq(len(ts),ts[1]-ts[0])
+		n=int(len(ws)/2)
+		ws/=dt # convert to THz: e.g. .002 picosecond timesteps, every 10th timestep logged
+		#print(np.shape(dfft)) # nω, na, 3
 
-	print("saving dDOS and vDOS")
-	ddos=np.sum(np.absolute(dfft[:,:,1]),axis=1) # nω, na, 3 --select-Y--> nω, na --sum-a--> nω
-	vdos=np.sum(np.absolute(vfft[:,:,1]),axis=1)
-	#plot([ws,ws],[ddos/np.trapz(ddos),vdos/np.trapz(vdos)],markers=['-']*2,labels=["ddos","vdos"],xlim=[0,None],ylim=[0,None])
-	out=np.zeros((len(ddos),3)) ; out[:,0]=ws ; out[:,1]=ddos ; out[:,2]=vdos
-	np.savetxt(outDirec+"/DOS.txt",out)
-	ddos/=np.trapz(ddos) ; vdos/=np.trapz(vdos)
+		print("saving dDOS and vDOS")
+		ddos=np.sum(np.absolute(dfft[:,:,1]),axis=1) # nω, na, 3 --select-Y--> nω, na --sum-a--> nω
+		vdos=np.sum(np.absolute(vfft[:,:,1]),axis=1)
+		#plot([ws,ws],[ddos/np.trapz(ddos),vdos/np.trapz(vdos)],markers=['-']*2,labels=["ddos","vdos"],xlim=[0,None],ylim=[0,None])
+		out=np.zeros((len(ddos),3)) ; out[:,0]=ws ; out[:,1]=ddos ; out[:,2]=vdos
+		np.savetxt(outDirec+"/DOS.txt",out)
+		ddos/=np.trapz(ddos) ; vdos/=np.trapz(vdos)
 
-	print("generating frequency masks")
-	Xs_d=[ws] ; Ys_d=[ddos] ; masks=[] ; Xs_v=[ws] ; Ys_v=[vdos]
+		print("generating frequency masks")
+		Xs_d=[ws] ; Ys_d=[ddos] ; masks=[] ; Xs_v=[ws] ; Ys_v=[vdos]
 
-	energyCenters=np.linspace(fmin,fmax,numBands+1)[1:]
-	if bandWidth==0:
-		bandWidth=(energyCenters[1]-energyCenters[0])/2.5
+		energyCenters=np.linspace(fmin,fmax,numBands+1)[1:]
+		if bandWidth==0:
+			bandWidth=(energyCenters[1]-energyCenters[0])/2.5
 
-	for i,ec in enumerate(energyCenters):
+		for i,ec in enumerate(energyCenters):
+			mask=np.exp(-(ws-ec)**2/2/bandWidth**2)
+			mask+=np.exp(-(-ws-ec)**2/2/bandWidth**2) # apply mask to both sides
+			mask/=np.amax(mask)
+			Xs_d.append(ws) ; Ys_d.append(mask*ddos)			# nω vs nω
+			Xs_v.append(ws) ; Ys_v.append(mask*vdos)			# nω vs nω
+			masks.append(mask)
 
-		mask=np.exp(-(ws-ec)**2/2/bandWidth**2)
-		mask+=np.exp(-(-ws-ec)**2/2/bandWidth**2) # apply mask to both sides
-		mask/=np.amax(mask)
-		Xs_d.append(ws) ; Ys_d.append(mask*ddos)			# nω vs nω
-		Xs_v.append(ws) ; Ys_v.append(mask*vdos)			# nω vs nω
-		masks.append(mask)
+		markers=['k-']+rainbow(len(Xs_d)-1)
+		plot(Xs_d,Ys_d,markers=markers,xlim=[0,Emax],ylim=[0,None],xlabel="frequency (THz)",ylabel="DOS",title="FFT(disp)",labels=[""]*len(Xs_d),filename=outDirec+"/DOS_d.png")
+		plot(Xs_v,Ys_v,markers=markers,xlim=[0,Emax],ylim=[0,None],xlabel="frequency (THz)",ylabel="DOS",title="FFT(velo)",labels=[""]*len(Xs_v),filename=outDirec+"/DOS_v.png")
+
 
 	out=np.zeros((len(ws)+1,len(energyCenters)+1))
 	out[1:,0]=ws ; out[0,1:]=energyCenters
@@ -267,9 +292,6 @@ def generateEnergyMasks(fmin,fmax,numBands,bandWidth=0):
 	header=["ws"]+["m"+str(i) for i in range(len(energyCenters)) ] 
 	np.savetxt(outDirec+"/energyMasks.csv",out,header=",".join(header)+" # first row is center of energy bin",delimiter=",")
 
-	markers=['k-']+rainbow(len(Xs_d)-1)
-	plot(Xs_d,Ys_d,markers=markers,xlim=[0,Emax],ylim=[0,None],xlabel="frequency (THz)",ylabel="DOS",title="FFT(disp)",labels=[""]*len(Xs_d),filename=outDirec+"/DOS_d.png")
-	plot(Xs_v,Ys_v,markers=markers,xlim=[0,Emax],ylim=[0,None],xlabel="frequency (THz)",ylabel="DOS",title="FFT(velo)",labels=[""]*len(Xs_v),filename=outDirec+"/DOS_v.png")
 
 	return energyCenters,masks
 
@@ -605,15 +627,17 @@ def energyLoss(psi,plotOut=False,mask=None):
 	cohe=np.absolute(sumpsi)**2
 	Ivib=inco-cohe
 
-	kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
-	contour(np.log(cohe).T,kxs,kys,filename=outDirec+"/cohe_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")
-	contour(np.log(inco).T,kxs,kys,filename=outDirec+"/inco_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")
-
 	if plotOut:
 		kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
+		contour(np.log(cohe).T,kxs,kys,filename=outDirec+"/cohe_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")
+		contour(np.log(inco).T,kxs,kys,filename=outDirec+"/inco_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")
+		#kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
 		#zlim=max(abs(np.amin(Ivib)),abs(np.amax(Ivib))) ; zlim=[-zlim,zlim] ; print("ZLIM",zlim)
 		contour(Ivib.T,kxs,kys,filename=outDirec+"/Ivib_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")#,zlim=zlim)
 	return Ivib
+
+# END GENERAL FUNCTIONS
+
 
 # POST PROCESSING CODE:
 # nukeBadFP: occasionally we'll get nans in our psifiles. fix those
@@ -777,11 +801,7 @@ def layerDOS(mask=None,maskname=""): # prototype of this code in figs_abEELS_AlN
 		plot(Xs,Ys,xlabel="Frequency (THz)",ylabel="Energy Loss (a.u.)",labels=lbls,title=outDirec,markers=rainbow(nLayers),xlim=[0,Xs[0][-1]],ylim=[0,None],filename=outfile+".png")
 	return Xs,Ys
 
-# maskDOS > layerDOS > eDOS > psifileToIvib > energyLoss
-def maskDOS():
-	infile=sys.argv[-1]
-	readInputFile(infile)
-	print(outDirec)
+def processKmasks(preview=True):
 
 	kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
 	diff=np.load(outDirec+"/diff.npy")
@@ -799,14 +819,20 @@ def maskDOS():
 		overplot.append({"kind":"line","xs":[xi,xi,xf,xf,xi],"ys":[yi,yf,yf,yi,yi]})
 		overplot.append({"kind":"text","xs":[(xi+xf)/2],"ys":[(yi+yf)/2],"text":[kmask_lbl[len(masks)-1]]})
 	for i,(cx,cy,r) in enumerate(zip(kmask_cxs,kmask_cys,kmask_rad)):
-		print("circular mask: center = (",np.round(cx,4),",",np.round(cy,4),") , r = ",np.round(r,4))
-		mask=np.ones((len(kxs),len(kys)))
+		if isinstance(r,(float,int)):
+			print("circular mask: center = (",np.round(cx,4),",",np.round(cy,4),") , r = ",np.round(r,4)) ; r=[r]
+		else:
+			print("nested circular mask: center = (",np.round(cx,4),",",np.round(cy,4),") , r = ",[ np.round(v,4) for v in r])
+		mask=np.zeros((len(kxs),len(kys)))
 		radii=np.sqrt( (kxs[:,None]-cx)**2+(kys[None,:]-cy)**2 )
-		mask[radii>r]=0
+		pm=1
+		for v in reversed(sorted(r)):
+			mask[radii<=v]=pm ; pm=(pm+1)%2 ; print(pm)
 		masks.append(mask)
-		xline=np.linspace(cx-r*.99,cx+r*.99,100) ; yline=np.sqrt(r**2-(xline-cx)**2)
-		overplot.append({"kind":"line","xs":list(xline)+list(xline[::-1]),"ys":list(cy+yline)+list(cy-yline)})
-		overplot.append({"kind":"text","xs":[cx],"ys":[cy],"text":[kmask_lbl[len(masks)-1]]})
+		for v in r:
+			xline=np.linspace(cx-v*.99,cx+v*.99,100) ; yline=np.sqrt(v**2-(xline-cx)**2)
+			overplot.append({"kind":"line","xs":list(xline)+list(xline[::-1]),"ys":list(cy+yline)+list(cy-yline),'c':'k'})
+		overplot.append({"kind":"text","xs":[cx],"ys":[cy],"text":[kmask_lbl[len(masks)-1]],'c':'k'})
 
 	lblkwargs={"horizontalalignment":"center","verticalalignment":"center","size":10}
 	for op in overplot:
@@ -815,10 +841,21 @@ def maskDOS():
 		for k in lblkwargs:
 			op[k]=lblkwargs[k]
 	#print(overplot)
-	print("PREVIEW MASKS")
-	for i,mask in enumerate(masks):
-		diff[mask==1]*=10000
-	contour(np.log(diff).T,kxs,kys,xlabel="$\AA$^-1",ylabel="$\AA$^-1",overplot=overplot,filename=outDirec+"/diffmasks.png")
+	if preview:
+		print("PREVIEW MASKS")
+		for i,mask in enumerate(masks):
+			diff[mask==1]*=10000
+		contour(np.log(diff).T,kxs,kys,xlabel="$\AA$^-1",ylabel="$\AA$^-1",overplot=overplot,filename=outDirec+"/diffmasks.png")
+
+	return masks
+
+# maskDOS > layerDOS > eDOS > psifileToIvib > energyLoss
+def maskDOS():
+	infile=sys.argv[-1]
+	readInputFile(infile)
+	print(outDirec)
+
+	masks=processKmasks()
 
 	print("PROCESS EWAVES FOR MASKS")
 	#Xs=[] ; Ys=[]
@@ -841,6 +878,99 @@ def maskDOS():
 	#	Xs.append(data[:,0]) ; Ys.append(data[:,-1])
 	
 	#plot(Xs,Ys,markers=rainbow(len(Xs)),filename=outDirec+"/maskedDOS.png",labels=kmask_lbl)
+
+# slopefit: y,x indices! for an intensity field z as a function of x and y, find the line that best bisects it (used for fitting on diffraction spots)
+# how does it work? "center of mass in x and in y" are easy: cx=np.sum(zs*xs[None,:])/np.sum(zs), which is simply "weight each value by it's distance in x" and so on. we're calculating the "moment" about zero, mass*distance. for slope, we first find the centers, then calculate the slope to each point from the center: slopes=(ys[None,:]-cy)/(xs[:,None]-cx) and the distance to each point l=np.sqrt((xs[:,None]-cx)**2+(ys[None,:]-cy)**2). then we weight the slopes by the mass and the distance from the center: m=np.sum(Ivib*slopes*l)/np.sum(Ivib*l)
+# try it yourself, here's a couple useful example distributions to try: 
+# zs=np.exp(-(xs[None,:]-ys[:,None])**2/2/2**2)*np.exp(-(ys[:,None]-5)**2/2/2**2) # for a slanted gaussian centered at 5,5
+# zs=np.exp(-((xs[None,:]+5)-2*ys[:,None])**2/2/2**2)*np.exp(-(ys[:,None]-5)**2/2/2**2) # same, but with a different slope
+def slopefit(zs,xs,ys,cx=None,cy=None):
+	if cx is None:
+		cx=np.sum(zs*xs[None,:])/np.sum(zs)
+	if cy is None:
+		cy=np.sum(zs*ys[:,None])/np.sum(zs)
+	xc=xs-cx ; yc=ys-cy
+	slopes=yc[:,None]/xc[None,xc!=0]
+	distances=np.sqrt(xc[None,:]**2+yc[:,None]**2)
+	m =np.sum(zs[:,xc!=0]*slopes*distances[:,xc!=0])/np.sum(zs[:,xc!=0]*distances[:,xc!=0])
+	islopes=xc[None,:]/yc[yc!=0,None]
+	im=np.sum(zs[yc!=0,:]*islopes*distances[yc!=0,:])/np.sum(zs[yc!=0,:]*distances[yc!=0,:])
+	overplot=[ {"xs":xs,"ys":m*(xs-cx)+cy,"kind":"line","c":"r","linestyle":":"},
+		{"xs":im*(ys-cy)+cx,"ys":ys,"kind":"line","c":"r","linestyle":":"} ]
+	contour(zs,xs,ys,overplot=overplot)
+	return m,cx,cy
+
+def kmaskCOG():
+	infile=sys.argv[-1]
+	readInputFile(infile)
+	print(outDirec)
+
+	masks=processKmasks(preview=False)
+	print(masks)
+
+	ecdata=np.loadtxt(outDirec+"/energyMasks.csv",delimiter=",")
+	global energyCenters
+	energyCenters=ecdata[0,1:]
+	npts=1 ; nLayers=1 ; layer=0 ; point=0
+	if CONVERGENCE!=0 and len(probePositions)>1:
+		npts=len(probePositions)
+	if layerwise!=0:
+		nLayers=int(open(outDirec+"/nLayers.txt").readlines()[0])
+	if nLayers>1:
+		layers=list(range(nLayers)) ; layer=layers[layer] ; print("layer",layer)# handle "-1" to denote "last layer"
+	kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")	
+
+	for e in tqdm(range(len(energyCenters))):
+		overplot=[]
+		for i,mask in enumerate(masks):
+			print(i,mask,mask.shape)
+			# psi_e9_[fp9]_[l8]_[p7].npy : fp ifof parallelFP=True, l ifof layerwise!=0, p ifof CONVERGENCE!=0 & len(probePositions)>1
+			if parallelFP:
+				psifile=outDirec+"/psi_e"+str(e) +\
+					{True:"_l"+str(layer),False:""}[nLayers>1] +\
+					{True:"_p"+str(point),False:""}[npts>1] +".npy"
+			else:
+				psifile=[ outDirec+"/psi_e"+str(e)+"_fp"+str(fp) +\
+					{True:"_l"+str(layer),False:""}[nLayers>1] +\
+					{True:"_p"+str(point),False:""}[npts>1] +".npy" 
+					for fp in range(numFP) ]
+			print("reading psi file",psifile)
+			Ivib=psifileToIvib(psifile,e) # EITHER process psifile(s) OR read in saved ivib file
+			Ivib*=mask
+			m,cx,cy=slopefit(Ivib.T,kxs,kys,cx=kmask_cxs[i],cy=kmask_cys[i])
+			# center of mass of disk:
+			#cx=np.sum(Ivib*kxs[:,None])/np.sum(Ivib) # prototyped in figs_abEELS_AlN_thiccc/COM.py
+			#cy=np.sum(Ivib*kys[None,:])/np.sum(Ivib)
+			# this isn't actually what we want to do? this will tell us the "offcenteredness" of the disks. 
+			# we want, like, a line through the disk at some angle like they do in https://arxiv.org/pdf/2407.08982
+			overplot.append({ "xs":kxs,"ys":m*(kxs-cx)+cy,"kind":"line","c":"r"})
+
+		Ivib=psifileToIvib(psifile,e)
+		for m in masks:
+			Ivib*=(10+m)
+		contour(Ivib.T,kxs,kys,xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[e])+" THz",overplot=overplot)#,zlim=zlim,cmap='Spectral')
+
+
+		#if plotDiffractions:
+		#kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
+		#zlim=max(abs(np.amin(Ivib)),abs(np.amax(Ivib))) ; zlim=[-zlim,zlim] ; print("ZLIM",zlim)
+		#contour(Ivib.T,kxs,kys,xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[e])+" THz",overplot=overplot)#,zlim=zlim,cmap='Spectral')
+
+
+		#xs.append(energyCenters[e]) ; ys.append(np.sum(Ivib))
+
+	
+	#print("PROCESS EWAVES FOR MASKS")
+	##Xs=[] ; Ys=[]
+	#for i,mask in enumerate(masks):
+	#	# layerDOS (layerDOS_maskname.png, layerDOS_maskname.txt) > eDOS (Ivib...png, eDOS...png)
+	#	X,Y=layerDOS(mask=mask,maskname=kmask_lbl[i])
+	#	#shutil.move(outDirec+"/postProcessDOS.txt",outDirec+"/postProcessDOS_"+str(i)+".txt")
+	#	picDirec=outDirec+"/Ivib_"+kmask_lbl[i]
+	#	os.makedirs(picDirec,exist_ok=True)
+	#	for f in glob.glob(outDirec+"/Ivib_*.png")+[outDirec+"/layerDOS_"+kmask_lbl[i]+".png",outDirec+"/layerDOS_"+kmask_lbl[i]+".txt"]+glob.glob(outDirec+"/eDOS_*.png"):
+	#		shutil.move(f,picDirec)
+
 
 # use settings restartFrom="..." and saveExitWave=True. the exit wave from one run will be used as the entrance wave (instead of a probe) for the next run, which will allow simulating infinitely-thick samples without needing to build out a ridiculously thick potential. 
 # BUT, this means a huge number of beam view images are created (annoying) and wave files are stored for each run (wastes space). 
@@ -965,26 +1095,38 @@ def fakePhononCycles():
 	# RUN DOS
 	eDOS()
 
+def cycle():			# use settings restartFrom="..." and saveExitWave=True. the exit wave from one run will be used as the entrance
+	while True:	 	# wave (instead of a probe) for the next run, which will allow simulating infinitely-thick samples without 
+		main()		# needing to build out a ridiculously thick potential
+
+funcAliases={"pre":"preprocessOutputs","DOS":"eDOS","cc":"cycleCleanup"}
 # if called directly, run main(). does not run if imported "from abEELS import *"
 if __name__=='__main__':
 	if len(sys.argv)==2:
 		main()
-	elif sys.argv[1]=="pre":
-		preprocessOutputs()
-	elif sys.argv[1]=="DOS":
-		eDOS()
-	elif sys.argv[1]=="layerDOS":
-		layerDOS()
-	elif sys.argv[1]=="maskDOS":
-		maskDOS()
-	elif sys.argv[1]=="cycle":	# use settings restartFrom="..." and saveExitWave=True. the exit wave from one run will be used as the entrance
-		while True:	 	# wave (instead of a probe) for the next run, which will allow simulating infinitely-thick samples without 
-			main()		# needing to build out a ridiculously thick potential
-	elif sys.argv[1]=="cc":
-		cycleCleanup()
-	elif sys.argv[1]=="psiCombiner":	# if you run "python3 abEELS.py psiCombiner figs_abEELS_AlN_*_cycle0", bash will explode out the "*"
-		psiCombiner()			# before passing to python! then we'll combine like-files from each
-	elif sys.argv[1]=="cycleCombiner":
-		cycleCombiner()
-	elif sys.argv[1]=="fakePhononCycles":
-		fakePhononCycles()
+	else:
+		fun=sys.argv[1] 
+		if fun in funcAliases:
+			fun = funcAliases[ fun ]
+		c=fun+"()"
+		exec(c)
+
+	#elif sys.argv[1]=="pre":
+	#	preprocessOutputs()
+	#elif sys.argv[1]=="DOS":
+	#	eDOS()
+	#elif sys.argv[1]=="layerDOS":
+	#	layerDOS()
+	#elif sys.argv[1]=="maskDOS":
+	#	maskDOS()
+	#elif sys.argv[1]=="cycle":
+	#	while True:
+	#		main()
+	#elif sys.argv[1]=="cc":
+	#	cycleCleanup()
+	#elif sys.argv[1]=="psiCombiner":	# if you run "python3 abEELS.py psiCombiner figs_abEELS_AlN_*_cycle0", bash will explode out the "*"
+	#	psiCombiner()			# before passing to python! then we'll combine like-files from each
+	#elif sys.argv[1]=="cycleCombiner":
+	#	cycleCombiner()
+	#elif sys.argv[1]=="fakePhononCycles":
+	#	fakePhononCycles()
