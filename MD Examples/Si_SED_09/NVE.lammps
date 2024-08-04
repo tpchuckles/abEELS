@@ -1,0 +1,32 @@
+########### $HEADER$ ###########
+log NVE.out
+units			metal
+boundary		p p p
+atom_style		molecular
+read_data		positions.pos
+change_box all remap
+pair_style sw
+pair_coeff * * SiGe.sw Si
+thermo_style		custom step temp press etotal pe ke vol
+thermo 1
+minimize		1e-999 1e-999 100 100
+velocity		all create 600 1 dist gaussian mom yes
+dump myDump		all xyz 5000 NVE.dump
+dump_modify myDump	sort id
+fix 3 all nvt temp 300 300 0.2
+	timestep	0.002
+	thermo		200
+	run		1000000
+unfix 3
+fix 2 all nve
+	compute vacf1 all vacf
+	thermo_style	custom step temp press etotal pe ke vol c_vacf1[4] pxx pyy pzz 
+	timestep	0.002
+	thermo		10
+	run		2000000
+
+	dump qdump		all custom 10 NVE.qdump id type x y z vx vy vz
+	dump_modify qdump	sort id
+	thermo 			0 #turn off thermostyle logging (no point, and just makes pDOS analysis more complicated)
+	run			20000
+unfix 2
