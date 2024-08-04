@@ -1,0 +1,22 @@
+# MD INPUTS AND RUN PARAMETERS
+path="../../../MD/projects/Si_SED_09/"
+dumpfile="NVE.qdump"
+atomTypes=["Si"]
+nx,ny,nz=25,25,5	# how many unit cells in x,y,z
+a,b,c=5.43729,5.43729,5.43729 # unit cell definition, Å,°
+dt=0.002*10		# timestep (picoseconds) times sampling rate (every nth step)
+
+# GEOMETRY POST-PROCESSING
+trim=[[15,20],[15,20],[]] # add two values (unit cell counts) to any dimension to trim to that size
+tiling=[1,1,1]	# expanding the simulation in direction parallel to beam will lead to artifacts in reciprical space
+beamAxis=2	# abtem default is to look down z axis. we'll rotate the sim if you specify 0 or 1
+flipBeam=False	# default is to look from +z towards -z, but we can mirror the simulation too (e.g. if we're more sensitivity to top layers)
+
+# ABTEM PARAMETERS
+semiAngle=5 ; maxrad=100 # probe convergence angle (mrad. 0 for parallel). maxrad is how far out in diffraction space to store the exit wave
+layerwise=0	# every nth. set to 0 for no depth-dependence
+# mode="Zeiger" ; numFP=20 ; Emax=20 ; Ebins=20 # Zeiger settings: energy binned displacements form Ψ(E,q,r). num configs per bin, and e bin definitions 
+mode="JACR" ; concurrentTimesteps=10 ; maxTimestep=200 # Castellanos-Reyes settings: ewave sim for each timestep Ψ(t,q,r), fourier transformed to Ψ(ω,q,r)
+
+
+
