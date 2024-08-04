@@ -1,0 +1,21 @@
+# MD INPUTS AND RUN PARAMETERS
+path="../../../MD/projects/AlN_SED_tall/"
+dumpfile="NVE.qdump"
+atomTypes=["Al","N"]
+nx,ny,nz=4,4,40	# how many unit cells in x,y,z # BZ FOLDS ONCE IN X (100 BZ PTS) AND TWICE IN Y (124 BZ BTS)
+a=12.75572/nx ; b=11.04677756356124/ny ; c=207.69428000000002/nz # pulled from lammps pos file, allows tiling without worrying about skewed primitive cell
+dt=0.0005*30		# timestep (picoseconds) x sampling rate (every nth step)
+
+# GEOMETRY POST-PROCESSING
+trim=[[],[],[28,32]] # add two values (unit cell counts) to any dimension to trim to that size
+tiling=[1,1,1]	# expanding the simulation in direction parallel to beam will lead to artifacts in reciprical space
+beamAxis=1	# abtem default is to look down z axis. we'll rotate the sim if you specify 0 or 1
+flipBeam=False	# default is to look from +z towards -z, but we can mirror the simulation too (e.g. if we're more sensitivity to top layers)
+
+# ABTEM PARAMETERS
+semiAngle=30 ; maxrad=100 # probe convergence angle (mrad. 0 for parallel). maxrad is how far out in diffraction space to store the exit wave
+layerwise=0	# every nth. set to 0 for no depth-dependence
+mode="PZ" ; numFP=50 ; Emax=30 ; Ebins=120 # Zeiger settings: energy binned displacements form Ψ(E,q,r). num configs per bin, and e bin definitions 
+#mode="JACR" ; concurrentTimesteps=100 ; maxTimestep=500 # Castellanos-Reyes settings: ewave sim for each timestep Ψ(t,q,r), fourier transformed to Ψ(ω,q,r)
+
+probePositions=[[2*c,2*a],[1.8*c,2*a]]

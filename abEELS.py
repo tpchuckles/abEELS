@@ -408,6 +408,11 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 			modifyProbe(Z,xs,ys)
 			contour(np.real(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png")
 			contour(np.imag(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png")
+	else: # PLANE WAVE INSTEAD OF CONVERGENT PROBE (just define the plane wave params)
+		plane_wave = abtem.PlaneWave(energy=100e3, sampling=0.05)
+
+
+
 
 	if plotOut:
 		atoms=atomStack[0]
@@ -427,9 +432,6 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 			plt.savefig(outDirec+"/beam2.png")
 		abtem.show_atoms(atoms,plane="yz"); plt.title("side view") ; plt.savefig(outDirec+"/side.png")
 
-
-	else: # PLANE WAVE INSTEAD OF CONVERGENT PROBE (just define the plane wave params)
-		plane_wave = abtem.PlaneWave(energy=100e3, sampling=0.05)
 
 	# STEP 4 CALCULATE EXIT WAVE
 	print("calculating exit waves") ; start=time.time()
@@ -717,41 +719,67 @@ def sliceE(nth=1):
 #     .'    |   	(3) m=0 xi=0 yi=4/a would be an offset horizontal slice,
 #   .'      o   	    where selectivity rules will show T modes only in
 #           |  		    the first BZ.
-def dispersion(m=0,xi=0,yi=4/5.43729,xlim=[0,12/5.43729],ylim=[-np.inf,np.inf]):
-	psi=np.load(outDirec+"/ivib.npy")
+def dispersion():
+	global a,b,c
+	# copied from preprocessPositions, since we need lattice parameters a,b,c to line up with our diffraction pattern
+	if beamAxis!=2: # default is to look down z, so we need to flip axes if we want to look down a different direction
+		rollby=[-1,1][beamAxis] # to look down x, roll -1 [x,y,z] --> [y,z,x]. to look down y, roll +1 [x,y,z] --> [z,x,y]
+		a,b,c=np.roll([a,b,c],rollby)
+	#print(a,b,c) ; sys.exit()
+
+	# TODO hardcoding linescan here, but should figure out a way to make them passable via command-line args or something
+	# m=0 ; xi=0 ; yi=4/b ; xlim=[0,12/a] ; ylim=[-np.inf,np.inf] 		# Si, Xo
+	m=0 ; xi=0 ; yi=0 ; xlim=[0,12/a] ; ylim=[-np.inf,np.inf] 		# Si, Xc
+	m=1 ; xi=0 ; yi=0 ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] 		# Si, Kc
+	m=1 ; xi=-2/a ; yi=2/b ; xlim=[-2/a,4/a] ; ylim=[-np.inf,np.inf] 	# Si, Ko
+	#m=0 ; xi=0 ; yi=2/b ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] # for AlN
+
+	#psi=np.load(outDirec+"/ivib.npy")
 	ws=np.load(outDirec+"/ws.npy")
 	kxs=np.load(outDirec+"/kxs.npy")
 	kys=np.load(outDirec+"/kys.npy")
 
+	chunks=psiFileNames(prefix="ivib")
+	print(chunks)
+
 	ijs=[]
 	if m<1:
-		for i in range(len(kxs)):
+		for i in tqdm(range(len(kxs))):
 			x=kxs[i] ; y=m*(x-xi)+yi
 			if x<xlim[0] or x>xlim[1] or y<ylim[0] or y>ylim[1]:
 				continue
 			j=np.argmin(np.absolute(kys-y)) ; ijs.append([i,j])
 	else:
-		for j in range(len(kys)):
+		for j in tqdm(range(len(kys))):
 			y=kys[j] ; x=1/m*(y-yi)+xi
 			if x<xlim[0] or x>xlim[1] or y<ylim[0] or y>ylim[1]:
 				continue
 			i=np.argmin(np.absolute(kxs-x)) ; ijs.append([i,j])
 	
-	overplot={"xs":[],"ys":[],"kind":"line","color":"r","linestyle":":"} 
-	sliced=[] ; ks=[]
-	for n,ij in enumerate(ijs):
-		i,j=ij
-		sliced.append(psi[:,i,j])
-		distance=np.sqrt((kxs[i]-xi)**2+(kys[j]-yi)**2)
-		sign=1
-		if m>=0 and ( kxs[i]-xi < 0 or kys[j]-yi < 0 ):
-			sign=-1
-		ks.append(distance*sign)
-		overplot["xs"].append(kxs[i]) ; overplot["ys"].append(kys[j])
+	for fs in chunks:
+		print("load ivib/diff")
+		psi=np.load(fs[0]) ; filelabel=fs[0].split("/")[-1].replace("ivib","").replace(".npy","")
+		diff=np.load(outDirec+"/diff"+filelabel+".npy")
+		#print(np.amax(psi),np.nanmax(psi),np.amin(psi),np.nanmin(psi))
 
-	diff=np.load(outDirec+"/diff.npy")
-	contour(np.log(diff).T,kxs,kys,filename=outDirec+"/disp_linescan.png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="dispersion masked diffraction image",overplot=[overplot])
-	contour(np.log(np.absolute(sliced)).T,ks,ws,xlabel="k ($\AA$^-1)",ylabel="frequency (THz)",title="dispersion",filename=outDirec+"/dispersion.png")
+		overplot={"xs":[],"ys":[],"kind":"line","color":"r","linestyle":":"} 
+		sliced=[] ; ks=[]
+		for n,ij in enumerate(tqdm(ijs)):
+			i,j=ij
+			sliced.append(psi[:,i,j])
+			distance=np.sqrt((kxs[i]-xi)**2+(kys[j]-yi)**2)
+			sign=1
+			if m>=0 and ( kxs[i]-xi < 0 or kys[j]-yi < 0 ):
+				sign=-1
+			ks.append(distance*sign)
+			overplot["xs"].append(kxs[i]) ; overplot["ys"].append(kys[j])
+
+		#print(np.amax(sliced),np.amin(sliced))
+		sliced=np.absolute(sliced)
+		sliced[sliced==0]=np.amin(sliced[sliced>0])
+		#print(np.amax(sliced),np.amin(sliced))
+		contour(np.log(diff).T,kxs,kys,filename=outDirec+"/disp_linescan"+filelabel+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="dispersion masked diffraction image",overplot=[overplot])
+		contour(np.sqrt(sliced).T,ks,ws,xlabel="k ($\AA$^-1)",ylabel="frequency (THz)",title="dispersion",filename=outDirec+"/dispersion"+filelabel+".png") # i prefer sqrt scale to log scale, as it sort of "equalizes" big numbers
 
 def diffraction():
 	kxs=np.load(outDirec+"/kxs.npy")
