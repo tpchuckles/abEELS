@@ -2,4 +2,5 @@ figs*
 *pycache*
 old/*
 inputs/*
+outputs/*
 chained.sh

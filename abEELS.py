@@ -1,8 +1,3 @@
-# eigenVectors.py read from Si_300K and appears to successfully regenerates displacements-based vibrational DOS
-# momentumResolved.py and .ipynb read from Si_SED_03 and looks close to having figured out the momentum-resolved aspect
-# here, we combine those results (and explore whether the complex diffraction plane results still give vDOS
-# and we write it outside of jupyter so we can run on rivanna. and we skip the rotation so we can directly compare it against SED for Si_SED_04
-
 import sys,os,pyfftw,time,shutil,glob
 #sys.path.insert(1,"copiedPythonUtils")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__),'../../../MD') )	# in case someone "from abEELS import *" from somewhere else
@@ -14,129 +9,230 @@ from nicecontour import *
 import abtem,ase
 import matplotlib.pyplot as plt
 
-# TODO HUGE PROBLEM. ABTEM HAS LOOSE DEFINITIONS (OR MAYBE I DO) OF MATRIX INDICES. SOMETIMES AN INDEX WILL BE PRESENT FOR FP=1, OTHERTIMES NOT. IDK THE RHYME OR REASON. ALSO IF YOU HAVE MULTIPLE SCAN POSITIONS, THERE'S AN INDEX FOR IT, IF NOT, NO SCAN POSITION INDEX. WHICH MAKES IT VERY MESSY TO HAVE THE SAME CODE PROCESSING OUTPUTS FROM PLANE WAVES, CONVERGENT WAVES, MULTIPLE ATOM CONFIGURATIONS OR JUST ONE, AND MULTIPLE OR SINGULAR PROBE POSITIONS. NEED TO HAVE SOME SORT OF UNIFIED WAY OF HANDLING ALL THESE. 
-# NEED TO TEST ALL PERMUTATIONS OF PARAMETERS:
-# CONVERGENCE (0, !0),layerwise (0,!0), parallelFP (T,F), probePositions (len==0, len!=0)
+abtem.config.set({"precision": "float64"})
 
-# GENERAL PRINCIPLES OF OPERATION: 
-# read run parameters (readInputFile())
-# read molecular dynamics dump file (importPositions(), assumes filenames and stuff from input file. default behavior is to expect a dump file which should have atomic positions at numerous timesteps. we calculate an average position for each atom displacements from the mean. (variant 1: you can also feed your initial positions file (useLattice="filename.pos") and we'll use this instead of the average positions, with displacements from this "perfect" structure. variant 2: you can provide a file with positions only (not time-dependent) (dumpfile="filename.pos" ; dumptype="positions"). you won't get phonons, so we'll have to add them in artificially (addModes variable. see Si_cprobe input)). 
-# trimming/rotation/mirroring/stacking/tiling operations may be optionally applied, in this order. (preprocessPositions() handles trimming/rotation/mirroring, getFPconfigs() handles stacking/tiling. input file variables: trim, tiling, beamAxis, flipBeam)
-# a gaussian band-pass filter is applied to displacements (generateEnergyMasks() generates these, bandPassDisplacements() applies them)
-# an electron-wave propagation simulation is performed (ewave()). 
-# energy loss is simulated by subtracting coherent and incoherent parts from a number of frozen phonon configurations for a given energy bin (energyLoss()). this means the simulations are technically "energy resolved diffraction images" as opposed to "momentum resolved electron energy loss". no electrons lose energy within these simulations! (purely elastic electron wave propagation). 
+# (manual) unit test permutations: 
+# semiAngle (0, !0), layerwise (0,!0), probePositions (len==0, len!=0), mode ("PZ","JACR")
 
-# POST PROCESSING: 
-# You may be interested in simulating the phonon density of states (eDOS()), which is simply the sum over the 
+# TWO METHODLOGIES:
+# Paul Zeiger PRB 104, 104301 (2021): read in positions+displacements, preprocess (rotations/trimming/etc), perform band-pass filtering, run multislice on random configs ("frozen phonon" configurations) for each energy band, calculate Ψ(E,q,r) from coherent/incoherent parts across those multiple FP configs
+# José Ángel Castellanos-Reyes https://arxiv.org/html/2401.15599v1: read in positions+displacements,  preprocess (rotations/trimming/etc), run multislice on every timestep, calculate Ψ(ω,q,r) via fourier transform
 
-#, as a function of 
-# the sum
+# SHARED FUNCTIONS: 
+# readInputFile - setup
+# importPositions - read in positions+displacements
+# preprocessPositions - preprocess positions+displacements (rotations/trimming/etc)
+# ewave = run multislice on [one or more configurations]
+# UNIQUE FUNCTIONS:
+# bandPassDisplacements - perform band-pass filtering
+# energyLoss - calculate Ψ(E,q,r) from coherent/incoherent parts
+# np.fft.fft - calculate Ψ(ω,q,r) from Ψ(t,q,r)
+# TODO OLD FUNCTIONS NEED TO BE CLEANED UP, AND NONE OF THEM SHOULD BE HANDLING ANYTHING BUT IVIB FILES: nukeBadFP, psifileToIvib, preprocessOutputs, eDOS, layerDOS, processKmasks, maskDOS, kmaskCOG, cycleCleanup, cycleCombiner, psiCombiner, fakePhononCycles, cycle
 
-# BEGIN GENERAL FUNCTIONS
+# GENERAL FUNCTIONS
 
-def main():
-	infile=sys.argv[-1]
-	readInputFile(infile)
+# OLD METHOD: Paul Zeiger et al: PRB 104, 104301 (2021)
+# energy-binned displacements serve as FP configs. coherent/incoherent averaging yields energy-binned scattering
+# R(t) --> F{ } --> R(ω) mask=gaussian(ω) ; Rₘₐₛₖ(ω)=R(ω)*gaussian(E,ω) --> F⁻¹{ } --> Rₙ(E)
+# multislice for n configurations: Ψ(E,q,r,Rₙ)
+# Ψⁱⁿᶜᵒʰᵉʳᵉⁿᵗ(E,q,r)=1/N ⟨ | Ψ(q,r,Rₙ(E)) |² ⟩ₙ ; Ψᶜᵒʰᵉʳᵉⁿᵗ = | 1/N ⟨ Ψ(q,r,Rₙ(E)) ⟩ₙ | ²
+# Ψ(E,q,r) = Ψⁱⁿᶜᵒʰᵉʳᵉⁿᵗ(E,q,r) - Ψⁱⁿᶜᵒʰᵉʳᵉⁿᵗ(E,q,r)
+def main_PZ():
+	global energyCenters
 	importPositions()
 	#calculateLattice()
 	preprocessPositions()
 	energyCenters,masks=generateEnergyMasks(0,Emax,Ebins) # performs FFT on displacements, and generates gaussians we'll use for energy masking
-
 	for m,(ec,mask) in enumerate(zip(energyCenters,masks)):
-	#for m,ec,mask in zip(reversed(range(len(energyCenters))),reversed(energyCenters),reversed(masks)):
-		#if not (30<=m<40):
+		#if m<=110:
 		#	continue
 		print("PROCESSING ENERGY BAND:",ec)
-		#if os.path.exists(outDirec+"/psi_"+str(m)+".npy"):
-		#	print("skipping")
-		#	continue
+		# TODO ewave exits if the psi_eN*.npy file exists, but maybe we could check here too, and skip bandPassDisplacements and getFPconfigs?
 		bdisp=bandPassDisplacements(mask)	# energy band pass on displacements = iFFT(FFT(displacements)*gaussianMask)
 		atomStack=getFPconfigs(bdisp,plotOut=m)	# tiling and timestep selection for frozen phonon configurations
-		if parallelFP:	# may cause ram overload. e.g. 150Å x 150Å at 0.05Å spacing = 3000x3000 real-space sampling of waves, 64 bit complex
-			psi=ewave(atomStack,fileSuffix="e"+str(m),plotOut=(m==0)) # values. 1 FP config = 68 MB. multiply by the number of FP configs
+		#if parallelFP:	# may cause ram overload. e.g. 150Å x 150Å at 0.05Å spacing = 3000x3000 real-space sampling of waves, 64 bit complex
+		ewave(atomStack,fileSuffix="e"+str(m),plotOut=(m==0)) # values. 1 FP config = 68 MB. multiply by the number of FP configs
+
+	outfiles=psiFileNames(prefix="psi")
+	for chunk in outfiles:
+		psi=[ energyLoss(np.load(f)) for f in chunk ] # psi_eN*.npy files (nFP,kx,ky) (in)coherently summed --> kx,ky (for each energy)
+		if not os.path.exists(outDirec+"/ws.npy"):
+			np.save(outDirec+"/ws.npy",energyCenters)
+		outname=chunk[0].replace("psi","ivib").replace("_e0","")
+		np.save(outname,psi)
+# SOME PERFORMANCE CONSIDERATIONS: each layer slice and probe position and FP config are stored in memory (one gargantuan 6D data cube?), so if you run into issues with ram, consider setting numFP=1, then manually stitching your psi*.npy files together (each will be 2D kx,ky in that case, so load them and re-save them: psi_FP=[ np.load(f) for f in glob.glob("*/**/psi_eN_lN_pN.npy",recursive=True) ] ; np.save("psi_lN_pN.npy",psi_FP)
+# for extremely thick simulations, the potential itself is also enourmous. use thin slices, saveExitWave=True, and restartFrom=thisinputfilesname, run, rerun, rerun, etc. it will save the real-space exit wave, then use the previous real-space exit wave as the input-wave: we'd basically be doing multislice ourselves looped (add a layer via a separate run) instead of all at once in memory. this uses a lot of disk space, so if you need, all psi*.npy files can be deleted before the subsequent run (those were generated, but if this isn't the last layer we're interested in, they can be trashed), and all ewave*.npy files can be deleted *after* the subsequent run (those were only used to feed the subsequent run)
+
+# NEW METHOD: José Ángel Castellanos-Reyes et al. https://arxiv.org/html/2401.15599v1
+# electron wave is propagated for subsequent timesteps, and the wavefunction (as a function of time) if fouriered:
+# P(t,a,xyz) --> Ψ(t,q,r) --> F --> Ψ(ω,q,r)
+def main_JACR(): 
+	importPositions()	# reads in globals: velocities,ts,types,avg,disp
+	preprocessPositions()	# handles trimming/rotation, but NOT tiling
+	aseString=[ atomTypes[t-1]+"1" for t in types ]
+	aseString="".join(aseString) ; lx,ly,lz=a*nx,b*ny,c*nz
+ 
+	t0=0 
+	#t0=np.random.randint(len(ts)-maxTimestep) # TODO WHAT IS THE PROPER WAY TO STACK? for PZ method we select random (frequency-binned) timesteps for stacking in z. and tiling in x,y. here though, the temporal continuity maybe matters? 
+	if restartFrom:
+		offsets=np.linspace(0,len(ts)-maxTimestep,numCycles+2,endpoint=False,dtype=int)
+		#np.random.seed(1) # ALWAYS USE THE SAME SEED SO EACH RUN STEPS THROUGH THE SAME RANDOMIZED LIST
+		#np.random.shuffle(offsets)
+		t0=offsets[cycleID]
+		
+	# run ewave concurrently for chunks of timesteps
+	for t in np.arange(len(ts))[::concurrentTimesteps]:
+		if t>=maxTimestep:
+			break
+		atomStack=[]
+		for i in range(concurrentTimesteps):
+			print("USING TIMESTEP",t+i+t0)
+			atoms = ase.Atoms(aseString,positions=avg+disp[t+i+t0,:,:],pbc=[True,True,True],cell=[lx,ly,lz])
+			atomStack.append(atoms)
+		ewave(atomStack,fileSuffix="t"+str(t),plotOut=False)
+
+	outfiles=psiFileNames(prefix="psi")
+	for chunk in outfiles:
+		psi_t=[] # stack up chunked timesteps into one big list of timesteps
+		for f in chunk: # psi_t0.npy,psi_t10.npy,psi_t20.npy...
+			p=np.load(f) # ts,kx,ky
+			if concurrentTimesteps==1:	# if one timestep at a time, output files are 2D kx,ky instead of 3D t,kx,ky
+				psi_t.append(p)
+			else:
+				for i in range(concurrentTimesteps):
+					psi_t.append(p[i,:,:])
+		# FFT along time axis: Ψ(t,q,r) --> Ψ(ω,q,r)		# NOT SURE I SAW IT IN THE PAPER, BUT NEED TO SUBTRACT 
+		psi=np.fft.fft(psi_t-np.mean(psi_t,axis=0),axis=0) 	# OFF MEAN TO AVOID HIGH ZERO-FREQUENCY PEAK
+		ws=np.fft.fftfreq(n=len(psi_t),d=ts[1]-ts[0])
+		n=len(ws)//2 ; ws/=dt # convert to THz: e.g. .002 picosecond timesteps, every 10th timestep logged
+		# kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
+		# TODO NEED TO LOOP THROUGH LAYERS AND PROBE POSITIONS FOR SAVING
+		if not os.path.exists(outDirec+"/ws.npy"):
+			np.save(outDirec+"/ws.npy",ws)
+		outname=chunk[0].replace("psi","ivib").replace("_t0","")
+		np.save(outname,psi)
+
+# SHARED FUNCTIONS: 
+# for method=="PZ", we save off a "psi*.npy" file for each energy bin, which is a 3D matrix with FP,kx,ky indices. these are pre-summed, and are just the exit waves for each FP config. these are then "collapsed" into a single "ivib*.npy" file, which is 3D E,kx,ky indices. 
+# for method=="JACR", we save off "psi_t*.npy" files which are time-chunks, 3D matrix t,kx,ky indices. these are then summed into a single "ivib*.npy" file which is the same as above, a 3D E,kx,ky indices. 
+# layerwise!=0 will produce multiple of the above for each layer exported
+# semiAngle!=0 and len(probePositions)>1 will produce multiple of the above for each probe position. 
+# e.g. "psi_e9_[l8]_[p7].npy" ; "psi_t0_[l8]_[p7].npy" ; "ivib_[l8]_[p7].npy"
+# this function returns a list of groupings of files which should all be processed together [l0:e0,e1,e2...,p1:e0,e1,e2... etc]
+def psiFileNames(prefix="psi"):
+	nt=1 ; ne=1 ; nl=1 ; npt=1
+	if prefix=="psi": # look for "psi_eNNNN" or "psi_tNNNN"
+		filename=prefix+"_"+{"JACR":"t","PZ":"e"}[mode]
+		if mode=="PZ":
+			ne=len(energyCenters)
 		else:
-			psi0=ewave([atomStack[0]],fileSuffix="e"+str(m)+"_fp0",plotOut=(m==0))
-			#shape=list(np.shape(psi0)) ; shape[0]=len(atomStack) ; print(shape)
-			#psi=np.zeros(shape,dtype=type(psi0[0,0,0])) ; psi[0,:,:]+=psi0[0,:,:]
-			for n,aS in enumerate(atomStack):
-				psiN=ewave([atomStack[n]],fileSuffix="e"+str(m)+"_fp"+str(n),plotOut=False)
-				#psi[n,:,:]=psiN[0,:,:]
-		#energyLoss(psi)
+			nt=len(ts)
+	if layerwise!=0:
+		nl=len(np.load(outDirec+"/layers.npy"))
+	if semiAngle!=0 and len(probePositions)>1:
+		npt=len(probePositions)
+	filenames=[]
+	for l in reversed(range(nl)): # loop through layers in reverse! final exit wave is probably more relevant to most people
+		for p in range(npt):
+			filenames.append([])
+			for t in range(nt): # TODO NEED TO HANDLE SKIPPING BASED ON concurrentTimesteps
+				if t%concurrentTimesteps!=0:
+					continue
+				if t>=maxTimestep:
+					break
+				for e in range(ne):
+					psifile=outDirec+"/"+prefix+\
+					{True:"_e"+str(e),False:""}[ne>1] +\
+					{True:"_t"+str(t),False:""}[nt>1] +\
+					{True:"_l"+str(l),False:""}[nl>1] +\
+					{True:"_p"+str(p),False:""}[npt>1] + ".npy"
+					filenames[-1].append(psifile)
+	print(filenames)
+	return filenames
 
 def readInputFile(infile):
 	# READ IN THE FOLLOWING VARIABLES FROM THE INPUT FILE
-	# path,dumpfile,atomTypes,nx,ny,nz,a,b,c,dt,trim,beamAxis,flipBeam,tiling,CONVERGENCE
+	# path,dumpfile,atomTypes,nx,ny,nz,a,b,c,dt,trim,beamAxis,flipBeam,tiling,semiAngle
 	# Note no skewed primitive cells are currently supported for tiling
 	global path, dumpfile, dumptype, useLattice, atomTypes, nx, ny, nz, a, b, c ,dt, trim, beamAxis, flipBeam, tile
-	global CONVERGENCE, outDirec, probePositions, saveExitWave, restartFrom, restartDirec, addModes, modifyProbe
-	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl
+	global semiAngle, outDirec, probePositions, saveExitWave, restartFrom, restartDirec, addModes, modifyProbe, numFP
+	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl,deleteInputWave, cycleID
+	global concurrentTimesteps, maxTimestep ; concurrentTimesteps=10 ; maxTimestep=1000 ; numFP=1 ; deleteInputWave=False
 	kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl=[],[],[],[],[],[],[],[]
-	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False ; modifyProbe=False
+	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False ; modifyProbe=False ; cycleID=0
 	saveExitWave=False ; restartFrom=False
 	lines=open(infile,'r').readlines()
 	exec("".join(lines),globals())
 	kmask_lbl=kmask_lbl+[ str(v) for v in range(len(kmask_xis)+len(kmask_cxs)-len(kmask_lbl)) ]
 	print(kmask_lbl)
-	outDirec="figs_abEELS_"+infile.strip("/").split("/")[-1].split(".")[0]
+	outDirec="outputs/"+infile.strip("/").split("/")[-1].split(".")[0]
+	# set restartFrom to be the input file's own name, and we'll run once (no picking up from an input wave), then subsequent runs will append "cycleN" to the output folder (cycle0 picks up from the original output direc, cycle1 picks up from cycle0 and so on).
+	# if restartFrom is something *else* though, we won't append "cycleN" (useful if the cycling fails and you have an incomplete sub-run)
 	if restartFrom:
-		restartDirec="figs_abEELS_"+restartFrom ; RD=restartDirec
+		if (mode=="PZ" and numFP>1) or (mode=="JACR" and concurrentTimesteps>1):
+			print("ERROR: layer cycling not allowed for numFP>1 or concurrentTimesteps>1")
+			sys.exit()
+		restartDirec="outputs/"+restartFrom ; RD=restartDirec
 		if not os.path.exists(restartDirec):	# First run, restart direc might not exist (if so, turn off restartFrom)
-			restartFrom=False
+			restartFrom=False ; cycleID=0
 		else:
-			for i in range(numCycles):	# new output appends "cycleN"
-				OD=outDirec+"_cycle"+str(i)
-				if not os.path.exists(OD):	# if output direc already exists, that becomes our new restart direc
-					outDirec=OD
-					break
-				else:
-					RD=restartDirec+"_cycle"+str(i)
+			if restartFrom!=infile.split("/")[-1].replace(".txt",""):
+				restartDirec="outputs/"+restartFrom
 			else:
-				print("NUM CYCLES",numCycles,"REACHED. QUITTING")
-				sys.exit()
-			restartDirec=RD			# only update restartDirec once we've found the right N
+				for i in range(numCycles):	# new output appends "cycleN"
+					OD=outDirec+"_cycle"+str(i) ; cycleID+=1
+					if not os.path.exists(OD):	# if output direc already exists, that becomes our new restart direc
+						outDirec=OD
+						break
+					else:
+						RD=restartDirec+"_cycle"+str(i)
+				else:
+					print("NUM CYCLES",numCycles,"REACHED. QUITTING")
+					#sys.exit()
+				restartDirec=RD			# only update restartDirec once we've found the right N
 			print("RESTART SET: outDirec:",outDirec,"restartDirec",restartDirec)
 	os.makedirs(outDirec,exist_ok=True)
 	shutil.copy(infile,outDirec+"/")
 
 def importPositions():
-	global velocities,ts,types,avg,disp #,positions
+	global velocities,ts,types,avg,disp,positions
 
 	# read in from custom dump file, containing positions *and* velocities
 	if dumptype=="qdump":
-		# TODO WE DON'T ACTUALLY NEED ALL OF THESE (positions,velocities,ts,types,avg,disp). 
-		# IF avg AND disp FILES EXIST, WE SHOULD READ ONLY THOSE IN. (save on ram). 
-		#if not os.path.exists(path+"avg.npy") and os.path.exists(path+dumpfile+"_pos.npy"):
-		#	positions=np.load(path+dumpfile+"_pos.npy")
-		#	avg,disp=avgPos(positions,nx*a,ny*b,nz*c) # nt, na, 3
-		#	np.save(path+"avg.npy",avg)
-		#	np.save(path+"disp.npy",disp)
-
-		positions,velocities,ts,types=qdump(path+dumpfile)
-	
-		# calculate average positions (includes wrapping) and each atom's instantaneous displacement from the equilibrium position
-		print("averaging")
-		if os.path.exists(path+"avg.npy"):
-			positions=[]
+		if os.path.exists(path+"avg.npy"): # best case scenario: average positions / displacements npy files already exist: read them
+			print("reading existing npy files: avg,disp,typ,ts")
 			avg=np.load(path+"avg.npy")
 			disp=np.load(path+"disp.npy")
-		else:
+			types=np.load(path+dumpfile+"_typ.npy")
+			ts=np.load(path+dumpfile+"_ts.npy")
+			positions=avg+disp
+			velocities=np.load(path+dumpfile+"_vel.npy")
+		elif os.path.exists(path+dumpfile+"_pos.npy"): # next-best: positions npy file exists: read it, then run averaging.
+			print("reading existing npy files: pos,typ,ts")
+			positions=np.load(path+dumpfile+"_pos.npy") # note: qdump() will read these anyway, but we can skip that if they already exist
+			velocities=np.load(path+dumpfile+"_vel.npy")
+			types=np.load(path+dumpfile+"_typ.npy")
+			ts=np.load(path+dumpfile+"_ts.npy")
+			print("averaging positions")
 			avg,disp=avgPos(positions,nx*a,ny*b,nz*c) # nt, na, 3
 			np.save(path+"avg.npy",avg)
 			np.save(path+"disp.npy",disp)
-			positions=[]
-
+		else:					# last scenario: no npy files, so read qdump file
+			print("reading dump file")
+			positions,velocities,ts,types=qdump(path+dumpfile) # this will also save off pos/types/etc npy files
+			print("averaging positions")
+			avg,disp=avgPos(positions,nx*a,ny*b,nz*c) # nt, na, 3
+			np.save(path+"avg.npy",avg)
+			np.save(path+"disp.npy",disp)
 		if useLattice:
 			print("OVERWRITING AVERAGE POSITIONS FROM LATTICE FILE:",useLattice)
 			avg,typ=scrapePos(path+useLattice)
-
 	elif dumptype=="positions":
+		print("reading positions from pos file")
 		pos,types=scrapePos(path+dumpfile) # qdump positions,velocities are [nt,na,3]. avg is [na,3] and disp is [nt,na,3]
-		positions=np.asarray([pos,pos])
+		positions=[pos,pos]
 		velocities=np.zeros(np.shape(positions))
 		disp=np.zeros(np.shape(positions)) ; avg=pos ; ts=np.asarray([0,1])
-
-	#elif dumptype=="lattice":
-	#	
 
 	# WRAPPING: imagine a plane of atoms initialized at z=0. these atoms jiggle through the PBC, and there's a 50% chance their average is at the top vs bottom of the simulation. then when a wave hits "dangling" top atoms, we'll find asymmetry where there is none, and other strange e-wave interactions
 	# infer spacing 
@@ -148,6 +244,7 @@ def importPositions():
 		spacing.append(min(dxyz))
 	print("INFERRED INTERATOMIC SPACING",spacing,"(used for haircut)")
 	spacing=[ s/2 for s in spacing ]
+	print("spacing",spacing,"nx,ny,nz",nx,ny,nz,"a,b,c",a,b,c)
 	for i in range(3):
 		mask=np.zeros(len(avg))
 		l=[nx*a,ny*b,nz*c][i]
@@ -162,47 +259,13 @@ def importPositions():
 			print("add ",A,"*","sin(",k,"*","xyz[",p,"]","+",phi,")")
 			added=addWave(A,k,phi,p,v)
 			avg[:,:]+=added[:,:]
-			#positions[:,:,:]+=added[None,:]
-
-def addWave(A,k,phi,p_xyz,v_xyz):
-	na=len(avg)
-	# VECTOR MATH RIPPED STRAIGHT OUTA lammpsScapers.py > SED()
-	if isinstance(p_xyz,(int,float)): # 0,1,2 --> x,y,z
-		xs=avg[:,p_xyz] # a,xyz --> a
-	else:	# [1,0,0],[1,1,0],[1,1,1] and so on
-		# https://math.stackexchange.com/questions/1679701/components-of-velocity-in-the-direction-of-a-vector-i-3j2k
-		# project a vector A [i,j,k] on vector B [I,J,K], simply do: A•B/|B| (dot, mag)
-		# for at in range(na): x=np.dot(avg[at,:],p_xyz)/np.linalg.norm(p_xyz)
-		# OR, use np.einsum. dots=np.einsum('ij, ij->i',listOfVecsA,listOfVecsB)
-		p_xyz=np.asarray(p_xyz)
-		d=p_xyz[None,:]*np.ones((na,3)) # xyz --> a,xyz
-		xs=np.einsum('ij, ij->i',avg[:,:],d) # pos • vec, all at once
-		xs/=np.linalg.norm(p_xyz)
-	if isinstance(v_xyz,(int,float)):
-		displacementDirection=np.zeros(3)
-		displacementDirection[v_xyz]=1
-	else:
-		v_xyz/=np.sqrt(np.sum(np.asarray(v_xyz)**2))
-	displacementsToAdd=np.zeros(np.shape(avg))
-	for ijk in range(3):
-		displacementsToAdd[:,ijk]+=v_xyz[ijk]*A*np.sin(k*xs+phi)
-	return displacementsToAdd
-
-
-# HACKY FUNCTION USED FOR CALCULATING THE PRISTINE-LATTICE RESULTS. 
-# after importing pos/avg/disp, we simply read in your positions file (overwriting the calculated average positions) and zero-out displacements
-# all subsequent code (rotation, tiling, trimming, adding displacements for energy bands, calculating wave) thus are tricked into using the lattice
-#def calculateLattice():
-#	global avg,disp
-#	#scrapePos
-#	#avg=np.loadtxt(path+"positions.pos",skiprows=15)[:,3:]
-#	disp*=0
 
 # TRIM, TILE, ROTATE, FLIP
 #trim=[[],[],[]] # add two values (unit cell counts) to any dimension to trim to that size
 #tile=[1,10,1]	# expanding the simulation in direction parallel to beam will lead to artifacts in reciprical space
 #beamAxis=1	# abtem default is to look down z axis. we'll rotate the sim if you specify 0 or 1s
 #flipBeam=False	# default is to look from +z towards -z, but we can mirror the simulation too (e.g. if we're more sensitivity to top layers)
+# TODO TECHNICALLY OUR IMPLEMENTATION OF beamAxis AND flipBeam ARE WRONG. swapping axes is effectively mirroring across a 45° plane, and flibBeam mirrors across one of the three cartesian planes. mirroring is wrong though, think about chirality: you'll flip handedness
 def preprocessPositions():
 	global positions,velocities,ts,types,avg,disp,a,b,c,nx,ny,nz,tiling
 
@@ -239,8 +302,233 @@ def preprocessPositions():
 		disp[:,:,2]*=-1 # # nt,na,[x,y,z], no shift for displacements or velo
 		velocities[:,:,2]*=-1
 
-	# TODO TECHNICALLY BOTH OF THESE ARE WRONG. swapping axes is effectively mirroring across a 45° plane, and flibBeam mirrors across one of the three cartesian planes. mirroring is wrong though, think about chirality: you'll flip handedness
+def matstrip(ary): # strip all len==1 indices out of an N-D array. shape 2,1,3,4,1,7 turns into shape 2,3,4,7. useful for getting rid of spurious axes
+	shape=np.asarray(np.shape(ary))
+	ones=np.where(shape==1)[0]
+	for i in reversed(ones):
+		ary=np.sum(ary,axis=i)
+	return ary
 
+# SIMULATE E WAVES THROUGH A LIST OF ASE CONFIGURATIONS
+# 1. create the potential from the atomic configuration(s)
+# 2. define the probe
+# 3. denote where the probe is parked (create a GridScan object)
+# 4. calculate the exit wave
+# 5. transform exit wave to diffraction plane
+# ( Paul Zeiger method for frequency-resolved frozen phonon multislice: run this multiple energy bins (atomic configurations came from a band-pass filter on MD configurations), then calculate coherent/incoherent components across each energy bin's FP configs )
+# ( José Ángel Castellanos-Reyes method: run this for many consecutive timesteps, fourier time to ω: F{ Ψ(t,q,r) } --> Ψ(ω,q,r) )
+# this function generates a "psi_[fileSuffix]_[lN]_[pN].npy" file, where l optionally denotes a layer number (if layerwise!=0) and p denotes a probe position (if a convergent probe is used, semiAngle!=0, and if multple probePositions are specified)
+# ewave will NOT return the ewave (numerous may be created). we create the psi file, and calling code should go look for those files inside outDirec, which is "outputs/yourinputfilename/"
+def ewave(atomStack,fileSuffix,plotOut=False):
+	if "e0" in fileSuffix or "t0" in fileSuffix:
+		plotOut=True
+	print("ewave",fileSuffix)
+
+	# CHECK IF THIS HAS ALREADY BEEN RUN (note layerwise!=0 len(probePositions)!=1 runs all layers and probe positions in parallel, then we save off individually, SO, we just have to look for l0 and/or p0)
+	lookForFile=outDirec+"/psi_"+fileSuffix # suffix order is: e/t, l, p. e/t will have been passed by caller (fileSuffix)
+	if layerwise!=0:
+		lookForFile=lookForFile+"_l0"
+	npts=1
+	if semiAngle!=0 and len(probePositions)>1:
+		npts=len(probePositions)
+		lookForFile=lookForFile+"_p0"
+	lookForFile=lookForFile+".npy" # "psi_[fileSuffix]_[lN]_[pN].npy"
+	print("lookForFile",lookForFile)
+	if os.path.exists(lookForFile):
+		print("FIRST PSI-FILE FOUND FOR THIS CHUNK. SKIPPING",lookForFile)
+		return
+
+	# STEP 4, SIMULATE E WAVES
+	# 1. create the potential from the atomic configuration(s)
+	# 2. define the probe
+	# 3. denote where the probe is parked (create the GridScan object)
+	# 4. calculate the exit wave
+	# 5. transform exit wave to diffraction plane
+
+	# STEP 1.a CREATE ATOM ARRANGEMENT
+	frozen_phonons=abtem.AtomsEnsemble(atomStack)
+	# STEP 1.b CREATE POTENTIAL
+	print("setting up wave sim")
+	box=np.asarray(atomStack[0].cell).flat[::4] ; print("cell size: ",box)
+	potential_phonon = abtem.Potential(frozen_phonons, sampling=.05) #,slice_thickness=.01) # default slice thickness is 1Å
+	nLayers=1
+	if layerwise!=0:
+		nslices=potential_phonon.num_slices # 14.5 Å --> potential divided into 33 layers
+		nth=nslices//layerwise # 33 layers, user asked for 10? 33//10 --> every 3rd layer --> 11 layers total. 
+		nth=max(nth,1)		# user asked for 1000? 33//1000 --> 0! oops! just give them every layer instead. 
+		potential_phonon = abtem.Potential(frozen_phonons, sampling=.05,exit_planes=nth)#,slice_thickness=.01) # default slice thickness is 1Å
+		nLayers=potential_phonon.num_exit_planes
+		layers=np.arange(nLayers)*nth ; np.save(outDirec+"/layers.npy",layers) # TODO not 100% sure these are truly the plane locations
+		print("potential sliced into",nslices,"slices. keeping every",nth,"th layer, we'll have",nLayers,"exit waves")
+		#with open(outDirec+"/nLayers.txt",'w') as f:
+		#	f.write(str(nLayers))
+		# abtem/potentials/iam.py > class Potential() states: 
+		# exit_planes : If 'exit_planes' is an integer a measurement will be collected every 'exit_planes' number of slices.
+	if plotOut:
+		print("preview potential")
+		potential_phonon.show() ; plt.savefig(outDirec+"/potential.png")
+	print("potential extent:",potential_phonon.extent) #; sys.exit()
+	# STEP 2 DEFINE PROBE (or plane wave)
+	if restartFrom:
+		wavefile=restartDirec+"/ewave_"+fileSuffix+".npy" # TODO FOR NOW, WE'RE NOT ALLOWING RESTART FROM npts>1 OR nLayers>1
+		print("GET PROBE FROM EXIT WAVE",wavefile)
+		ewave=np.load(wavefile)
+		if len(np.shape(ewave))==2:
+			entrance_waves=abtem.waves.Waves(ewave,  energy=100e3, sampling=.05, reciprocal_space=False) 
+		else:
+			meta={'label': 'Frozen phonons', 'type': 'FrozenPhononsAxis' }
+			meta=[abtem.core.axes.FrozenPhononsAxis(meta)]
+			entrance_waves=abtem.waves.Waves(ewave,  energy=100e3, sampling=.05, reciprocal_space=False,ensemble_axes_metadata=meta)
+
+		# if we don't do this, we get extent=n*sampling, when really, the sampling should be more of a recommendation (real sampling = size/n)
+		entrance_waves.grid.match(potential_phonon) 
+	
+	elif semiAngle!=0: # CONVERGENT PROBE INSTEAD OF PLANE WAVE (needs probe defined, and scan to denote where probe is positioned)
+		probe = abtem.Probe(energy=100e3, semiangle_cutoff=semiAngle) # semiangle_cutoff is the convergence angle of the probe
+		probe.grid.match(potential_phonon)
+		print(probe.gpts)
+
+		if plotOut:
+			print("preview probe")
+			probe.show() ; plt.savefig(outDirec+"/probe.png")
+
+		# STEP 3, PROBE POSITION (user defined, or center of the sim volume)
+		if len(probePositions)>0:
+			custom_scan=abtem.CustomScan(probePositions) # TODO SHOULD PROBEPOSITIONS USE ABSOLUTE COORDINATES (Å), OR BE IN UNITS OF UNIT CELLS? 
+		else:
+			custom_scan=abtem.CustomScan([box[0]/2, box[1]/2])
+		print("scan positions:",custom_scan.get_positions())
+		npts=len(custom_scan.get_positions())
+
+		if modifyProbe: # your input file can define a function which does an in-plane modify of the complex probe function! 
+			probewave=probe.build(custom_scan).compute()
+			Z=probewave.array ; nx,ny=np.shape(Z)
+			LX,LY=probe.extent
+			xs=np.linspace(-LX/2,LX/2,nx) ; ys=np.linspace(-LY/2,LY/2,ny)
+			modifyProbe(Z,xs,ys)
+			contour(np.real(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png")
+			contour(np.imag(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png")
+
+	if plotOut:
+		atoms=atomStack[0]
+		abtem.show_atoms(atoms,plane="xy"); plt.title("beam view")
+		if semiAngle!=0:
+			if len(probePositions)>0:
+				plt.plot(*np.asarray(probePositions).T)
+			else:
+				plt.plot(box[0]/2,box[1]/2)
+		plt.savefig(outDirec+"/beam.png")
+		if semiAngle!=0:
+			pP=np.asarray(probePositions)
+			if len(pP)==0:
+				pP=np.asarray([[box[0]/2,box[1]/2]])
+			plt.xlim([min(pP[:,0])-5,max(pP[:,0])+5])
+			plt.ylim([min(pP[:,1])-5,max(pP[:,1])+5])
+			plt.savefig(outDirec+"/beam2.png")
+		abtem.show_atoms(atoms,plane="yz"); plt.title("side view") ; plt.savefig(outDirec+"/side.png")
+
+
+	else: # PLANE WAVE INSTEAD OF CONVERGENT PROBE (just define the plane wave params)
+		plane_wave = abtem.PlaneWave(energy=100e3, sampling=0.05)
+
+	# STEP 4 CALCULATE EXIT WAVE
+	print("calculating exit waves") ; start=time.time()
+	if restartFrom:
+		exit_waves = entrance_waves.multislice(potential_phonon).compute()
+		print("np.shape(exit_waves.array)",np.shape(exit_waves.array))
+		# PROBLEM:  stack of nFP entrance_waves and stack of nFP potential_phonon = nFP x nFP results! 
+		#abtem/waves.py > class Waves > def multislice > 
+		#	> potential = _validate_potential(potential, self)
+		# 	> multislice_transform = MultisliceTransform(potential=potential, detectors=detectors)
+		#	> waves = self.apply_transform(transform=multislice_transform)
+		#	> return _reduce_ensemble(waves)
+		#	abtem/multislice.py > class MultisliceTransform
+		#	abtem/array.py > def apply_transform > abtem/transform.py > def apply
+		# TODO WE'LL SELECT THE DIAGONAL FOR NOW, BUT IS THIS COMPUTATIONALLY HORRIBLE? SINCE WE CALCULATE NxN AND THROW OUT NxN-N?
+		# yes, much slower. 5 FPs takes 6s to generate the first round (using a single probe), and 41s to generate second round. 6.8x longer
+		# (6.8x longer to run 5x at once defeats the purpose of parallelFP)
+		if len(np.shape(ewave))==3:
+			ij=np.arange(numFP) ; ewave=exit_waves.array[ij,ij] 
+			meta={'label': 'Frozen phonons', 'type': 'FrozenPhononsAxis' }
+			meta=[abtem.core.axes.FrozenPhononsAxis(meta)]
+			exit_waves=abtem.waves.Waves(ewave,  energy=100e3, sampling=.05, reciprocal_space=False,ensemble_axes_metadata=meta)
+			entrance_waves.grid.match(potential_phonon) 
+	elif semiAngle!=0:
+		if modifyProbe:
+			exit_waves = probewave.multislice(potential_phonon).compute()
+		else:
+			exit_waves = probe.multislice(potential_phonon,scan=custom_scan).compute()
+	else:
+		exit_waves = plane_wave.multislice(potential_phonon).compute()
+	print("(took",time.time()-start,"s)")
+	print("ewave:",np.shape(exit_waves.array))
+	
+	# NOTE: shape of exit_waves can range from 2D to 6D depending on the potential. if atomStack is a list of atoms, we get nx,ny. 
+	# if atomStack is list-of-configurations, add nFP. with layerwise, add nlayers. 
+	# convergent beam gridscan adds probe positions x,y, and customscan adds singular probe position index. 
+	# plane-wave: 		nFP,[nlayers],nx,ny
+	# convergent gridscan: 	nFP,[nlayers],px,py,nx,ny # we don't do this anymore
+	# convergent custom:	nFP,[nlayers],ps,nx,ny
+	# OUTPUTTING: for any indices that are length 1, we get rid of them, via matstrip(). this means we can then fall back to variables npts, nLayers, and parallelFP to decide the dimensionality of whatever we're exporting and importing. any time npts>1 for example, we will loop through points and save each point's psi function separately. same goes for nLayers. only FPs are saved together.
+
+	if saveExitWave:
+		for l in range(nLayers):
+			for p in range(npts): # for psi, we do: psi_e9_[fp9]_[l8]_[p7].npy,
+				wavefile=outDirec+"/ewave_"+fileSuffix +\
+					{True:"_l"+str(l),False:""}[nLayers>1] +\
+					{True:"_p"+str(p),False:""}[npts>1] + ".npy"
+				np.save(wavefile,matstrip(exit_waves.array))
+
+	# STEP 5 CONVERT TO DIFFRACTION SPACE
+	print("converting exit wave to k space",end=" ")
+	sys.stdout.flush() # https://stackoverflow.com/questions/35230959/printfoo-end-not-working-in-terminal
+	start=time.time()
+	diffraction_complex = exit_waves.diffraction_patterns(max_angle=maxrad,block_direct=False,return_complex=True)
+	kx=diffraction_complex.sampling[-2]*diffraction_complex.shape[-2]/2 ; ky=diffraction_complex.sampling[-1]*diffraction_complex.shape[-1]/2
+	kxs=np.linspace(-kx,kx,diffraction_complex.shape[-2]) ; kys=np.linspace(-ky,ky,diffraction_complex.shape[-1])
+	if not os.path.exists(outDirec+"/kxs.npy"):
+		np.save(outDirec+"/kxs.npy",kxs) ; np.save(outDirec+"/kys.npy",kys)
+	print("took:",time.time()-start)
+	zr=diffraction_complex.array
+
+	print("saving off psi",end=" ")
+	sys.stdout.flush() # https://stackoverflow.com/questions/35230959/printfoo-end-not-working-in-terminal
+	start=time.time()
+	
+	# RECALL: SHAPE OF exit_waves, with exit_planes arg in potential_phonon:
+	# plane-wave: 		nFP,[nlayers],nx,ny
+	# convergent gridscan: 	nFP,[nlayers],px,py,nx,ny # we don't do this anymore
+	# convergent custom:	nFP,[nlayers],[ps],nx,ny
+
+	# for psi, we'll do: psi_e9_[fp9]_[l8]_[p7].npy,
+	for l in range(nLayers):
+		for p in range(npts): # below: filesuffix includes psi_e9_[fp9]
+			psifile=outDirec+"/psi_"+fileSuffix +\
+				{True:"_l"+str(l),False:""}[nLayers>1] +\
+				{True:"_p"+str(p),False:""}[npts>1] + ".npy"
+			zo=zr
+			if nLayers>1:
+				zo=zr[:,l]
+			if npts>1:
+				zo=zo[:,p]
+			zo=matstrip(zo)
+			np.save(psifile,zo)
+	print("took:",time.time()-start)
+
+	if restartFrom and deleteInputWave:
+		print("delete previous input wave file")
+		os.remove(restartDirec+"/ewave_"+fileSuffix+".npy")
+	#return zr # even if layerwise!=0, we'll end up with the last (thickest) psi. 
+
+# END SHARED FUNCTIONS
+
+# PZ-SPECIFIC FUNCTIONS: Paul Zeiger PRB 104, 104301 (2021), energy band pass filter displacements, run ewave for FP configs for each band, combine based on coherent/incoherent parts
+# generateEnergyMasks - generate band-pass windows
+# bandPassDisplacements - apply band-pass windows to displacements
+# getFPconfigs -
+# energyLoss - calculate Ψ(E,q,r) from coherent/incoherent parts
+
+# performs FFT on displacements, and generates gaussians we'll use for energy masking
 def generateEnergyMasks(fmin,fmax,numBands,bandWidth=0):
 	global dfft
 
@@ -284,7 +572,6 @@ def generateEnergyMasks(fmin,fmax,numBands,bandWidth=0):
 		plot(Xs_d,Ys_d,markers=markers,xlim=[0,Emax],ylim=[0,None],xlabel="frequency (THz)",ylabel="DOS",title="FFT(disp)",labels=[""]*len(Xs_d),filename=outDirec+"/DOS_d.png")
 		plot(Xs_v,Ys_v,markers=markers,xlim=[0,Emax],ylim=[0,None],xlabel="frequency (THz)",ylabel="DOS",title="FFT(velo)",labels=[""]*len(Xs_v),filename=outDirec+"/DOS_v.png")
 
-
 	out=np.zeros((len(ws)+1,len(energyCenters)+1))
 	out[1:,0]=ws ; out[0,1:]=energyCenters
 	for i,m in enumerate(masks):
@@ -292,9 +579,9 @@ def generateEnergyMasks(fmin,fmax,numBands,bandWidth=0):
 	header=["ws"]+["m"+str(i) for i in range(len(energyCenters)) ] 
 	np.savetxt(outDirec+"/energyMasks.csv",out,header=",".join(header)+" # first row is center of energy bin",delimiter=",")
 
-
 	return energyCenters,masks
 
+# 
 def bandPassDisplacements(energyMask):
 	print("calculate band pass on displacements")
 	disp_bandpass=np.real(np.fft.ifft(dfft*energyMask[:,None,None],axis=0)) # ω,a,3 --> t,a,3 with band-pass filter applied to only select displacements associated with specific modes
@@ -302,6 +589,7 @@ def bandPassDisplacements(energyMask):
 
 def getFPconfigs(disp_bandpass,plotOut=False):
 
+	os.makedirs(outDirec+"/configpics",exist_ok=True)
 	#configIDs=np.linspace(0,len(ts),numFP,endpoint=False,dtype=int)+offsetFP # TODO might be a nice idea to use different atom configs for each tile? if so, multiply numFP by tiling[0]*tiling[1]*tiling[2] and then parse them out during tiling (maybe use an iterator for getting positions to tile?)
 	#configIDs=np.linspace(0,len(ts),numFP*tiling[0]*tiling[1]*tiling[2],endpoint=False,dtype=int)+offsetFP
 	#np.random.shuffle(configIDs)
@@ -352,781 +640,232 @@ def getFPconfigs(disp_bandpass,plotOut=False):
 		#if m==0 and n==0:
 		if isinstance(plotOut,int) and n==0:
 			abtem.show_atoms(atoms,plane="xy"); plt.title("beam view")
-			if CONVERGENCE!=0:
+			if semiAngle!=0:
 				if len(probePositions)>0:
 					plt.plot(*np.asarray(probePositions).T)
 				else:
 					plt.plot(box[0]/2,box[1]/2)
-			plt.savefig(outDirec+"/"+str(plotOut)+"_beam.png")
-			if CONVERGENCE!=0:
+			plt.savefig(outDirec+"/configpics/"+str(plotOut)+"_beam.png")
+			if semiAngle!=0:
 				pP=np.asarray(probePositions)
 				if len(pP)==0:
 					pP=np.asarray([[box[0]/2,box[1]/2]])
 				plt.xlim([min(pP[:,0])-5,max(pP[:,0])+5])
 				plt.ylim([min(pP[:,1])-5,max(pP[:,1])+5])
-				plt.savefig(outDirec+"/"+str(plotOut)+"_beam2.png")
-			abtem.show_atoms(atoms,plane="yz"); plt.title("side view") ; plt.savefig(outDirec+"/"+str(plotOut)+"_side.png")
+				plt.savefig(outDirec+"//configpics/"+str(plotOut)+"_beam2.png")
+			abtem.show_atoms(atoms,plane="yz"); plt.title("side view") ; plt.savefig(outDirec+"/configpics/"+str(plotOut)+"_side.png")
 	return atomStack
 
-
-# TODO ought to have a savewave function to capture all the if/else/for conditions for layerwise and convergence
-# TODO need to figure out the "right" set of exports. e.g. validate if sum(realspace) is what we care about about and if we have any other use for the realspace file, then just save off sums to a text file. and validate if inversespace image can be remade from saved realspace (maybe we only should save off realspaces)
-
-# DONE: validate if export(realspace.diffraction) == reload(realspace).diffraction. see ewave_to_psi.py, we can convert saved-off ewaves to reciprocal space (but not the other way) and it matches (although there's a wild scaling issue, idk why, maybe from missing params in loading in the ewave as an abtem.waves.Waves object). 
-# DONE: validate dDOS calculations: sum(energyLoss(realspace)) == sum(energyLoss(reciprocal)) (or how different it will be). see checkloss.py
-# DONE: how far out in diffraction space do we *actually* need? see checkloss.py. we apply a mask to the imports psi.npy files and see how far in we can go bafore it no longer agreed with ewave.npy
-
-def matstrip(ary): # strip all len==1 indices out of an N-D array. shape 2,1,3,4,1,7 turns into shape 2,3,4,7. useful for getting rid of spurious axes
-	shape=np.asarray(np.shape(ary))
-	ones=np.where(shape==1)[0]
-	for i in reversed(ones):
-		ary=np.sum(ary,axis=i)
-	return ary
-
-def ewave(atomStack,fileSuffix,plotOut=False):
-	print("ewave",fileSuffix)
-
-	# CHECK IF THIS HAS ALREADY BEEN RUN
-	lookForFile=outDirec+"/psi_"+fileSuffix # suffix order is: e, l, p. e will have been passed by caller
-	if layerwise!=0:
-		lookForFile=lookForFile+"_l0"
-	npts=1
-	if CONVERGENCE!=0 and len(probePositions)>1:
-		npts=len(probePositions)
-		lookForFile=lookForFile+"_p0"
-	lookForFile=lookForFile+".npy"
-	print(lookForFile)
-	if os.path.exists(lookForFile):
-		print("FIRST PSI-FILE FOUND FOR THIS ENERGY BIN. SKIPPING")
-		print(lookForFile)
-		return 0
-
-	# STEP 4, SIMULATE E WAVES
-	# 1. create the potential from the atomic configuration(s)
-	# 2. define the probe
-	# 3. denote where the probe is parked (create the GridScan object)
-	# 4. calculate the exit wave
-	# 5. transform exit wave to diffraction plane
-	# 6. calculate coherent/incoherent components from (complex) wave function
-
-
-	# STEP 1.a CREATE ATOM ARRANGEMENT
-	frozen_phonons=abtem.AtomsEnsemble(atomStack)
-	# STEP 1.b CREATE POTENTIAL
-	print("setting up wave sim")
-	box=np.asarray(atomStack[0].cell).flat[::4] ; print("cell size: ",box)
-	potential_phonon = abtem.Potential(frozen_phonons, sampling=.05)#,slice_thickness=.01) # default slice thickness is 1Å
-	nLayers=1
-	if layerwise!=0:
-		nslices=potential_phonon.num_slices # 14.5 Å --> potential divided into 33 layers
-		nth=nslices//layerwise # 33 layers, user asked for 10? 33//10 --> every 3rd layer --> 11 layers total. 
-		nth=max(nth,1)		# user asked for 1000? 33//1000 --> 0! oops! just give them every layer instead. 
-		potential_phonon = abtem.Potential(frozen_phonons, sampling=.05,exit_planes=nth)#,slice_thickness=.01) # default slice thickness is 1Å
-		nLayers=potential_phonon.num_exit_planes
-		print("potential sliced into",nslices,"slices. keeping every",nth,"th layer, we'll have",nLayers,"exit waves")
-		with open(outDirec+"/nLayers.txt",'w') as f:
-			f.write(str(nLayers))
-		# abtem/potentials/iam.py > class Potential() states: 
-		# exit_planes : If 'exit_planes' is an integer a measurement will be collected every 'exit_planes' number of slices.
-	if plotOut:
-		print("preview potential")
-		potential_phonon.show() ; plt.savefig(outDirec+"/potential.png")
-	print("potential extent:",potential_phonon.extent) #; sys.exit()
-	# STEP 2 DEFINE PROBE (or plane wave)
-	if restartFrom:
-		wavefile=restartDirec+"/ewave_"+fileSuffix+".npy" # TODO FOR NOW, WE'RE NOT ALLOWING RESTART FROM npts>1 OR nLayers>1
-		print("GET PROBE FROM EXIT WAVE",wavefile)
-		ewave=np.load(wavefile)
-		if len(np.shape(ewave))==2:
-			entrance_waves=abtem.waves.Waves(ewave,  energy=100e3, sampling=.05, reciprocal_space=False) 
-		else:
-			meta={'label': 'Frozen phonons', 'type': 'FrozenPhononsAxis' }
-			meta=[abtem.core.axes.FrozenPhononsAxis(meta)]
-			entrance_waves=abtem.waves.Waves(ewave,  energy=100e3, sampling=.05, reciprocal_space=False,ensemble_axes_metadata=meta)
-
-		# if we don't do this, we get extent=n*sampling, when really, the sampling should be more of a recommendation (real sampling = size/n)
-		entrance_waves.grid.match(potential_phonon) 
-	
-	elif CONVERGENCE!=0: # CONVERGENT PROBE INSTEAD OF PLANE WAVE (needs probe defined, and scan to denote where probe is positioned)
-		probe = abtem.Probe(energy=100e3, semiangle_cutoff=CONVERGENCE) # semiangle_cutoff is the convergence angle
-		probe.grid.match(potential_phonon)
-		print(probe.gpts)
-
-		if plotOut:
-			print("preview probe")
-			probe.show() ; plt.savefig(outDirec+"/probe.png")
-
-		# STEP 3, PROBE POSITION (user defined, or center of the sim volume)
-		if len(probePositions)>0:
-			custom_scan=abtem.CustomScan(probePositions)
-		else:
-			custom_scan=abtem.CustomScan([box[0]/2, box[1]/2])
-		print("scan positions:",custom_scan.get_positions())
-		npts=len(custom_scan.get_positions())
-
-		if modifyProbe: # your input file can define a function which does an in-plane modify of the complex probe function! 
-			probewave=probe.build(custom_scan).compute()
-			Z=probewave.array ; nx,ny=np.shape(Z)
-			LX,LY=probe.extent
-			xs=np.linspace(-LX/2,LX/2,nx) ; ys=np.linspace(-LY/2,LY/2,ny)
-			modifyProbe(Z,xs,ys)
-			contour(np.real(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png")
-			contour(np.imag(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png")
-
-
-	else: # PLANE WAVE INSTEAD OF CONVERGENT PROBE (just define the plane wave params)
-		plane_wave = abtem.PlaneWave(energy=100e3, sampling=0.05)
-
-
-	# STEP 4 CALCULATE EXIT WAVE
-	print("calculating exit waves") ; start=time.time()
-	if restartFrom:
-		exit_waves = entrance_waves.multislice(potential_phonon).compute()
-		# PROBLEM:  stack of nFP entrance_waves and stack of nFP potential_phonon = nFP x nFP results! 
-		#abtem/waves.py > class Waves > def multislice > 
-		#	> potential = _validate_potential(potential, self)
-		# 	> multislice_transform = MultisliceTransform(potential=potential, detectors=detectors)
-		#	> waves = self.apply_transform(transform=multislice_transform)
-		#	> return _reduce_ensemble(waves)
-		#	abtem/multislice.py > class MultisliceTransform
-		#	abtem/array.py > def apply_transform > abtem/transform.py > def apply
-		# TODO WE'LL SELECT THE DIAGONAL FOR NOW, BUT IS THIS COMPUTATIONALLY HORRIBLE? SINCE WE CALCULATE NxN AND THROW OUT NxN-N?
-		# yes, much slower. 5 FPs takes 6s to generate the first round (using a single probe), and 41s to generate second round. 6.8x longer
-		# (6.8x longer to run 5x at once defeats the purpose of parallelFP)
-		if len(np.shape(ewave))==3:
-			ij=np.arange(numFP) ; ewave=exit_waves.array[ij,ij] 
-			meta={'label': 'Frozen phonons', 'type': 'FrozenPhononsAxis' }
-			meta=[abtem.core.axes.FrozenPhononsAxis(meta)]
-			exit_waves=abtem.waves.Waves(ewave,  energy=100e3, sampling=.05, reciprocal_space=False,ensemble_axes_metadata=meta)
-			entrance_waves.grid.match(potential_phonon) 
-	elif CONVERGENCE!=0:
-		if modifyProbe:
-			exit_waves = probewave.multislice(potential_phonon).compute()
-		else:
-			exit_waves = probe.multislice(potential_phonon,scan=custom_scan).compute()
-	else:
-		exit_waves = plane_wave.multislice(potential_phonon).compute()
-	print("(took",time.time()-start,"s)")
-	print("ewave:",np.shape(exit_waves.array))
-	
-	# NOTE: shape of exit_waves can range from 2D to 6D depending on the potential. if atomStack is a list of atoms, we get nx,ny. 
-	# if atomStack is list-of-configurations, add nFP. with layerwise, add nlayers. 
-	# convergent beam gridscan adds probe positions x,y, and customscan adds singular probe position index. 
-	# plane-wave: 		nFP,[nlayers],nx,ny
-	# convergent gridscan: 	nFP,[nlayers],px,py,nx,ny # we don't do this anymore
-	# convergent custom:	nFP,[nlayers],ps,nx,ny
-	# OUTPUTTING: for any indices that are length 1, we get rid of them, via matstrip(). this means we can then fall back to variables npts, nLayers, and parallelFP to decide the dimensionality of whatever we're exporting and importing. any time npts>1 for example, we will loop through points and save each point's psi function separately. same goes for nLayers. only FPs are saved together.
-
-	if saveExitWave:
-		for l in range(nLayers):
-			for p in range(npts): # for psi, we do: psi_e9_[fp9]_[l8]_[p7].npy,
-				wavefile=outDirec+"/ewave_"+fileSuffix +\
-					{True:"_l"+str(l),False:""}[nLayers>1] +\
-					{True:"_p"+str(p),False:""}[npts>1] + ".npy"
-				np.save(wavefile,matstrip(exit_waves.array))
-
-	if plotOut:
-		print("generating basic diffraction pattern")
-		diffraction = exit_waves.diffraction_patterns(max_angle=maxrad,block_direct=False)#.interpolate(.01)
-		diffraction.show() ; plt.savefig(outDirec+"/diffraction2.png")
-		kx=diffraction.sampling[-2]*diffraction.shape[-2]/2 ; ky=diffraction.sampling[-1]*diffraction.shape[-1]/2
-		kxs=np.linspace(-kx,kx,diffraction.shape[-2]) ; kys=np.linspace(-ky,ky,diffraction.shape[-1])
-		np.save(outDirec+"/kxs.npy",kxs) ; np.save(outDirec+"/kys.npy",kys)
-
-		diffarray=diffraction.array ; print("np.shape(diffarray)",np.shape(diffarray))
-		if nLayers>1:	# select *last* layer for diffraction pattern
-			diffarray=diffarray[:,-1]
-		if npts>1: # for psi, we'll do: psi_e9_[fp9]_[l8]_[p7].npy, but for diff, one fp is fine, last layer is fine. only loop through points
-			for p in range(npts):
-				diff=diffarray[:,p]
-				np.save(outDirec+"/diff_p"+str(p)+".npy",matstrip(diff))
-				diff=np.sum(diff,axis=0) # sum FP axis
-				contour(np.log(diff.T),kxs,kys,filename=outDirec+"/diffraction.png",xlabel="$\AA$^-1",ylabel="$\AA$^-1")
-		else:
-				diff=np.sum(diffarray,axis=0)
-				diff=matstrip(diff)
-				np.save(outDirec+"/diff.npy",diff)
-				out=np.log(diff.T) ; out[out<-23]=-23
-				contour(out,kxs,kys,filename=outDirec+"/diffraction.png",xlabel="$\AA$^-1",ylabel="$\AA$^-1")
-	else:
-		kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
-
-	# STEP 5 CONVERT TO DIFFRACTION SPACE
-	print("converting exit wave to k space",end=" ")
-	sys.stdout.flush() # https://stackoverflow.com/questions/35230959/printfoo-end-not-working-in-terminal
-	start=time.time()
-	diffraction_complex = exit_waves.diffraction_patterns(max_angle=maxrad,block_direct=False,return_complex=True)
-	print("took:",time.time()-start)
-	zr=diffraction_complex.array
-
-	print("saving off psi",end=" ")
-	sys.stdout.flush() # https://stackoverflow.com/questions/35230959/printfoo-end-not-working-in-terminal
-	start=time.time()
-	
-	# RECALL: SHAPE OF exit_waves, with exit_planes arg in potential_phonon:
-	# plane-wave: 		nFP,[nlayers],nx,ny
-	# convergent gridscan: 	nFP,[nlayers],px,py,nx,ny # we don't do this anymore
-	# convergent custom:	nFP,[nlayers],[ps],nx,ny
-
-	# for psi, we'll do: psi_e9_[fp9]_[l8]_[p7].npy,
-	for l in range(nLayers):
-		for p in range(npts): # below: filesuffix includes psi_e9_[fp9]
-			psifile=outDirec+"/psi_"+fileSuffix +\
-				{True:"_l"+str(l),False:""}[nLayers>1] +\
-				{True:"_p"+str(p),False:""}[npts>1] + ".npy"
-			zo=zr
-			if nLayers>1:
-				zo=zr[:,l]
-			if npts>1:
-				zo=zo[:,p]
-			zo=matstrip(zo)
-			np.save(psifile,zo)
-	print("took:",time.time()-start)
-
-	return zr # even if layerwise!=0, we'll end up with the last (thickest) psi. 
-
-def energyLoss(psi,plotOut=False,mask=None):
-	#print("calculating energy losses")
-	# COMPARING TO ZEIGER PRB 104, 104301 (2021) : They list:
-	# They use Ψ(q,r,R), where q is momentum, r is position of STEM probe, R is frozen-phonon configurations
-	# Our exit wave appears to be: Ψ(R,rx,ry,x,y), with 2 positional indices (x,y, from our scan)
-	# and our exit wave in real-space. to convert, use return_complex arg for diffraction_patterns: Ψ(R,rx,ry,ky,kx)
-	#np.save(outDirec+"/ewave_"+str(m)+".npy",exit_waves.array[:,0,0,:,:])
-	if mask is not None:
-		print("energyLoss, applying mask")
-		psi[:,:,:]*=mask[None,:,:]
-	#psi_o=np.load(outDirec+"/psi_avg.npy")
-	#kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
-	#psi=psi-psi_o[None,:,:]
-
-	#angles=np.zeros((len(kxs),len(kys)))
-	#for fp in tqdm(range(len(psi))):
-	#	for i in range(len(kxs)):
-	#		for j in range(len(kys)):
-	#			p1=psi[fp,i,j] ; p2=psi_o[i,j]
-	#			v1=[np.real(p1),np.imag(p1)] ; v2=[np.real(p2),np.imag(p2)]
-	#			m1=np.absolute(p1) ; m2=np.absolute(p2)
-	#			c=np.dot(v1,v2)/m1/m2
-	#			if c>1:
-	#				c=1
-	#			if c<-1:
-	#				c=-1
-	#			#else:
-	#			angles[i,j]+=np.arccos(c)
-	#angles/=len(psi)
-	#Ivib=angles #np.mean(crosses,axis=0)
-
-	#dpsi=psi-psi_o[None,:,:]
-	#Ivib=np.absolute(dpsi)**2/np.absolute(psi_o[None,:,:])**2
-	#Ivib=np.sum(Ivib,axis=0)/len(psi)
-
+# given a 3D matrix (nFP,kx,ky), perform coherent/incoherent averaging
+# COMPARING TO ZEIGER PRB 104, 104301 (2021) : They list:
+# They use Ψ(q,r,R), where q is momentum, r is position of STEM probe, R is frozen-phonon configurations
+#  Note the default exit-wave from abtem is real-space Ψ(R,rx,ry,x,y), so you can convert you can use return_complex arg for diffraction_patterns to get Ψ(R,rx,ry,ky,kx), and for sanity, we're going to use Ψ(R,kx,ky) ONLY (and if you have multiple probe positions rx,ry (coming from our customScan) or layers, pass them in separately).
+def energyLoss(psi):
 	nFP=len(psi) ; print("nFP",nFP)
 	abpsisq=np.absolute(psi)**2 # incoherent = 1/N ⟨ | Ψ(q,r,Rₙ(ω)) |² ⟩ₙ (where "⟨ ⟩ₙ" means Σₙ)
 	inco=1/nFP*np.sum(abpsisq,axis=0) # sum FP configs, keep kx axis
 	sumpsi=1/nFP*np.sum(psi,axis=0) # coherent =  | 1/N ⟨ Ψ(q,r,Rₙ(ω)) ⟩ₙ | ²
 	cohe=np.absolute(sumpsi)**2
-	Ivib=inco-cohe
+	return inco-cohe
 
-	if plotOut:
-		kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
-		contour(np.log(cohe).T,kxs,kys,filename=outDirec+"/cohe_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")
-		contour(np.log(inco).T,kxs,kys,filename=outDirec+"/inco_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")
-		#kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
-		#zlim=max(abs(np.amin(Ivib)),abs(np.amax(Ivib))) ; zlim=[-zlim,zlim] ; print("ZLIM",zlim)
-		contour(Ivib.T,kxs,kys,filename=outDirec+"/Ivib_"+str(plotOut)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[plotOut])+" THz")#,zlim=zlim)
-	return Ivib
+# END PZ-SPECIFIC FUNCTIONS
 
-# END GENERAL FUNCTIONS
+# POST PROCESSING / ANALYSIS FUNCTIONS: at this main_PZ and main_JACR should have created ivib*.npy files in the appropriate output directory. these are 3D (E,kx,ky) matrices and post-processing is just a matter of slicing up the 3D matrix in different ways. sum across kx,ky to get vDOS (states vs ω), take a slice across k to get the dispersion (ω vs k), take slices across ω to get an energy-resolved diffraction image (kx vs ky)
 
+def eDOS():
+	ws=np.load(outDirec+"/ws.npy")
 
-# POST PROCESSING CODE:
-# nukeBadFP: occasionally we'll get nans in our psifiles. fix those
-# psifileToIvib: "flatten" a psifile stack: exit-wave-per-FP (3D) --> energyLoss
-#   calculation --> kspace energy slice (2D) --> ivib file. this means all 
-#   subsequent analysis code can be very efficient, as it simply needs to scoop 
-#   up the ivib file (instead of re-processing the psi files)
-# preprocess: loop through all psifiles, call psifileToIvib
-# eDOS: simply loop through energy bins, scoop up ivib files, sum, and plot
-# layerDOS: loop through layers, calling eDOS
-
-# on rare occasion (don't yet know why) psi files will have nan for all entries for one (or more) frozen phonon configuration. energyLoss will then choke on it (summing across FP configs, where one is nan, will produce nan). run this on the problematic file (assumes parallelFP=True, ie, psi file indices are nFP,nkx,nky). In the future we may add a check to energyLoss and a call to here, but I want to keep an eye on it. 
-# Harrison saw an issue with this. deleting the psi-file and re-running did *not* fix the issue (had to run nukeBadFP anyway)
-def nukeBadFP(psifile):
-	psi=np.load(psifile)
-	where=np.where(np.isnan(psi))
-	badFPids=list(set(where[0]))
-	where=np.where(psi>1e12)
-	badFPids=badFPids+list(set(where[0]))
-	mask=np.zeros(len(psi)) ; mask[badFPids]=1
-	psi=psi[mask!=1]
-	os.rename(psifile,psifile.replace(".npy","_bak.npy"))
-	np.save(psifile,psi)
-	
-# pass either a single 3D psifile (nFP,nkx,nky), OR a list of 2D psifiles (one per FP, nkx,nky) and we'll read it in, call energyLoss(), and save off the result. this makes later remasking faster (read in ivib file, instead of needing to read in full psi file(s) and re-calculating)
-def psifileToIvib(psifiles,e):
-	print(psifiles)
-	# check if ivib file exists
-	if isinstance(psifiles,list):
-		outfile=psifiles[0].replace("_fp0","").replace("psi_","ivib_")
-	else:
-		outfile=psifiles.replace("psi_","ivib_")
-	# if so, return contents (skip re-reading psifile and recalculation)
-	if os.path.exists(outfile):
-		print("psifileToIvib, found outfile",outfile,", skipping")
-		return np.load(outfile)
-	# for parallelFP=False, we need to assemble psi wave stack of FP configs
-	if isinstance(psifiles,list):
-		print("parallFP=False, assembling psi")
-		pwave0=np.load(psifiles[0])[:,:]
-		pwaves=pwave0[None,:,:]*np.ones(len(psifiles))[:,None,None]
-		for fp,psifile in enumerate(psifiles):
-			if not os.path.exists(fp):
-				break
-			pwaves[fp]=np.load(psifile)[:,:]
-	else:
-		pwaves=np.load(psifiles)
-	# calculate eloss
-	#plotOut={True:e,False:False}[plotDiffractions] # pass the energy band number (gets appended to filename), ifof pD=True
-	print("calling energyLoss")
-	Ivib=energyLoss(pwaves,plotOut=False)
-	np.save(outfile,Ivib)
-	return Ivib
-
-def preprocessOutputs():
-	infile=sys.argv[-1]
-	readInputFile(infile)
-	# LOOPING: if layerwise!=0, calculate for each layer. if CONVERGENCE!=0 & len(probePositions)>1, calculate for each probe position. if parallelFP==False, MUST ASSEMBLE PSI STACK and then calculate Ivib once over the whole stack
-	ecdata=np.loadtxt(outDirec+"/energyMasks.csv",delimiter=",")
-	global energyCenters
-	energyCenters=ecdata[0,1:]
-	npts=1 ; nLayers=1
-	if CONVERGENCE!=0 and len(probePositions)>1:
-		npts=len(probePositions)
-	if layerwise!=0:
-		nLayers=int(open(outDirec+"/nLayers.txt").readlines()[0])
-	for e in range(Ebins):
-		for p in range(npts):
-			for l in range(nLayers):
-				if parallelFP:
-					psifile=outDirec+"/psi_e"+str(e) +\
-						{True:"_l"+str(l),False:""}[nLayers>1] +\
-						{True:"_p"+str(p),False:""}[npts>1] +".npy"
-				else:
-					psifile=[ outDirec+"/psi_e"+str(e)+"_fp"+str(fp) +\
-						{True:"_l"+str(l),False:""}[nLayers>1] +\
-						{True:"_p"+str(p),False:""}[npts>1] +".npy" for fp in range(numFP) ]
-				psifileToIvib(psifile,e)
-
-# layerDOS > eDOS > psifileToIvib > energyLoss
-
-# CALCULATE energyLoss() FOR EACH ENERGY BIN (for a given layer, point, k-space mask)
-def eDOS(layer=-1,point=0,mask=None,plotDiffractions=True):
-	infile=sys.argv[-1]
-	readInputFile(infile)
-	ecdata=np.loadtxt(outDirec+"/energyMasks.csv",delimiter=",")
-	global energyCenters
-	energyCenters=ecdata[0,1:]
-	npts=1 ; nLayers=1
-	if CONVERGENCE!=0 and len(probePositions)>1:
-		npts=len(probePositions)
-	if layerwise!=0:
-		nLayers=int(open(outDirec+"/nLayers.txt").readlines()[0])
-	if nLayers>1:
-		layers=list(range(nLayers)) ; layer=layers[layer] ; print("layer",layer)# handle "-1" to denote "last layer"
-
-	outfile = outDirec+"/eDOS" + {True:"_l"+str(layer),False:""}[nLayers>1] + {True:"_p"+str(point),False:""}[npts>1]
-	if mask is None and os.path.exists(outfile+".txt"):
-		print("RELOADING DOS FROM SAVED FILE",outfile+".txt")
-		out=np.loadtxt(outfile+".txt")
-		xs,ys=out.T
-		return xs,ys
-
-	xs=[] ; ys=[]
-	for e in tqdm(range(len(energyCenters))):
-		# psi_e9_[fp9]_[l8]_[p7].npy : fp ifof parallelFP=True, l ifof layerwise!=0, p ifof CONVERGENCE!=0 & len(probePositions)>1
-		if parallelFP:
-			psifile=outDirec+"/psi_e"+str(e) +\
-				{True:"_l"+str(layer),False:""}[nLayers>1] +\
-				{True:"_p"+str(point),False:""}[npts>1] +".npy"
-		else:
-			psifile=[ outDirec+"/psi_e"+str(e)+"_fp"+str(fp) +\
-				{True:"_l"+str(layer),False:""}[nLayers>1] +\
-				{True:"_p"+str(point),False:""}[npts>1] +".npy" 
-				for fp in range(numFP) ]
-		print("reading psi file",psifile)
-		Ivib=psifileToIvib(psifile,e) # EITHER process psifile(s) OR read in saved ivib file
-		if mask is not None:
-			Ivib*=mask
-		if plotDiffractions:
-			kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
-			#zlim=max(abs(np.amin(Ivib)),abs(np.amax(Ivib))) ; zlim=[-zlim,zlim] ; print("ZLIM",zlim)
-			contour(Ivib.T,kxs,kys,filename=outDirec+"/Ivib_"+str(e)+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[e])+" THz")#,zlim=zlim,cmap='Spectral')
-
-
-		xs.append(energyCenters[e]) ; ys.append(np.sum(Ivib))
-	# Ivib = 1/N Σₙ[ | Ψ |² ] - 1/N | Σₙ[ Ψ ] | ²
-	#outfile = outDirec+"/eDOS" + {True:"_l"+str(layer),False:""}[nLayers>1] + {True:"_p"+str(point),False:""}[npts>1]
-	plot([xs],[ys],xlabel="Frequency (THz)",ylabel="$\Sigma$ |$\Psi$|^2 - | $\Sigma$ $\Psi$ |^2 (-)",filename=outfile+".png",markers=['k-'])
-	if mask is None:
-		out=np.zeros((len(energyCenters),2)) ; out[:,0]=energyCenters ; out[:,1]=ys
-		np.savetxt(outfile+".txt",out)
-	return xs,ys
-
-# LOOP THROUGH LAYERS, CALLING eDOS (sum over k for each energy bin, for each layer, generate EELS spectrum at each layer)
-def layerDOS(mask=None,maskname=""): # prototype of this code in figs_abEELS_AlN_SED_01a/checkeloss.py
-	infile=sys.argv[-1]
-	readInputFile(infile)
-	# if layerwise!=0:
+	chunks=psiFileNames(prefix="ivib")
+	print(chunks)
 	Xs=[] ; Ys=[] ; lbls=[]
-	# LOOPING: if layerwise!=0, calculate for each layer. if CONVERGENCE!=0 & len(probePositions)>1, calculate for each probe position. if parallelFP==False, MUST ASSEMBLE PSI STACK and then calculate Ivib once over the whole stack
-	npts=1 ; nLayers=1
-	if CONVERGENCE!=0 and len(probePositions)>1:
-		npts=len(probePositions)
-	if layerwise!=0:
-		nLayers=int(open(outDirec+"/nLayers.txt").readlines()[0])
+	for fs in chunks:
+		if not os.path.exists(fs[0]): # e.g. we deleted early layers' files or something 
+			continue
+		psi=np.load(fs[0])
+		Xs.append(ws) ; Ys.append(np.sum(np.absolute(psi),axis=(1,2)))
+		lbls.append(fs[0])
+	Ys=[ y[ws>1] for y in Ys ] ; Xs=[ x[x>1] for x in Xs ]
+	#Ys=[ y/np.amax(y[ws>2]) for y in Ys ]
+	plot(Xs,Ys,xlabel="frequency (THz)",ylabel="DOS (-)",labels=lbls,markers=rainbow(len(Xs)),filename=outDirec+"/eDOS.png",title="raw DOS")
+	Ys=[ y/np.amax(y[Xs[0]>2]) for y in Ys ]
+	plot(Xs,Ys,xlabel="frequency (THz)",ylabel="DOS (-)",labels=lbls,markers=rainbow(len(Xs)),filename=outDirec+"/eDOS_norm.png",title="peak normed")
 
-	for p in range(npts):
-		Xs=[] ; Ys=[] ; lbls=[]
-		for l in range(nLayers):
-			print("point",p,"layer",l)
-			xs,ys=eDOS(l,p,mask=mask,plotDiffractions=(l==nLayers-1))
-			Xs.append(xs) ; Ys.append(ys) ; lbls.append("")
-		outfile=outDirec+"/layerDOS" +\
-			{True:"_p"+str(p),False:""}[npts>1] +\
-			{True:"",False:"_"+maskname}[ mask is None ]
-		out=np.zeros((len(xs),len(Xs)+1)) ; out[:,0]=xs
-		for i,ys in enumerate(Ys):
-			out[:,i+1]=ys
-		np.savetxt(outfile+".txt",out)
-		plot(Xs,Ys,xlabel="Frequency (THz)",ylabel="Energy Loss (a.u.)",labels=lbls,title=outDirec,markers=rainbow(nLayers),xlim=[0,Xs[0][-1]],ylim=[0,None],filename=outfile+".png")
-	return Xs,Ys
+def sliceE(nth=1):
+	ws=np.load(outDirec+"/ws.npy")
+	kxs=np.load(outDirec+"/kxs.npy")
+	kys=np.load(outDirec+"/kys.npy")
+	os.makedirs(outDirec+"/slices",exist_ok=True)
 
-def processKmasks(preview=True):
+	chunks=psiFileNames(prefix="ivib")
+	print(chunks)
+	for fs in chunks:
+		psi=np.load(fs[0])
+		fo=fs[0].split("/") ; fo.insert(2,"slices") ; fo="/".join(fo) # outputs/inputfilename/ivib.npy --> outputs/inputfilename/slices/ivib.npy
+		for i in tqdm(range(len(ws))):
+			if i%nth!=0:
+				continue
+			contour(np.absolute(psi[i]).T,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(ws[i])+" THz")#,zlim=zlim,cmap='Spectral')
 
-	kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
+#           | (1)	take a 2D slice out of the E,kx,ky data cube to get
+#           o      (2)	ω vs k. arguments m, xi, yi define the slice via
+# (3)       |    .'	point-slope form: y-yi=m*x-xi). xi,yi denote the
+#  -----o---o---o-----	"origin" for k-space in the final dispersion.
+#           | .'  	(1) m=np.inf xi=0 yi=0 would be the phonon dispersion
+#   o   o   o'  o   o	    ω vs ky (Γ to X). beware selectivity rules: no
+#         .'|   	    T modes will be shown!
+#       o'  o   o	(2) m=1 xi=0 yi=0 would be Γ to M or something.
+#     .'    |   	(3) m=0 xi=0 yi=4/a would be an offset horizontal slice,
+#   .'      o   	    where selectivity rules will show T modes only in
+#           |  		    the first BZ.
+def dispersion(m=0,xi=0,yi=4/5.43729,xlim=[0,12/5.43729],ylim=[-np.inf,np.inf]):
+	psi=np.load(outDirec+"/ivib.npy")
+	ws=np.load(outDirec+"/ws.npy")
+	kxs=np.load(outDirec+"/kxs.npy")
+	kys=np.load(outDirec+"/kys.npy")
+
+	ijs=[]
+	if m<1:
+		for i in range(len(kxs)):
+			x=kxs[i] ; y=m*(x-xi)+yi
+			if x<xlim[0] or x>xlim[1] or y<ylim[0] or y>ylim[1]:
+				continue
+			j=np.argmin(np.absolute(kys-y)) ; ijs.append([i,j])
+	else:
+		for j in range(len(kys)):
+			y=kys[j] ; x=1/m*(y-yi)+xi
+			if x<xlim[0] or x>xlim[1] or y<ylim[0] or y>ylim[1]:
+				continue
+			i=np.argmin(np.absolute(kxs-x)) ; ijs.append([i,j])
+	
+	overplot={"xs":[],"ys":[],"kind":"line","color":"r","linestyle":":"} 
+	sliced=[] ; ks=[]
+	for n,ij in enumerate(ijs):
+		i,j=ij
+		sliced.append(psi[:,i,j])
+		distance=np.sqrt((kxs[i]-xi)**2+(kys[j]-yi)**2)
+		sign=1
+		if m>=0 and ( kxs[i]-xi < 0 or kys[j]-yi < 0 ):
+			sign=-1
+		ks.append(distance*sign)
+		overplot["xs"].append(kxs[i]) ; overplot["ys"].append(kys[j])
+
 	diff=np.load(outDirec+"/diff.npy")
+	contour(np.log(diff).T,kxs,kys,filename=outDirec+"/disp_linescan.png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="dispersion masked diffraction image",overplot=[overplot])
+	contour(np.log(np.absolute(sliced)).T,ks,ws,xlabel="k ($\AA$^-1)",ylabel="frequency (THz)",title="dispersion",filename=outDirec+"/dispersion.png")
 
-	print("ASSEMBLE MASKS")
-	global kmask_lbl
-	overplot=[] ; masks=[]
+def diffraction():
+	kxs=np.load(outDirec+"/kxs.npy")
+	kys=np.load(outDirec+"/kys.npy")
+	os.makedirs(outDirec+"/slices",exist_ok=True)
 
-	for i,(xi,xf,yi,yf) in enumerate(zip(kmask_xis,kmask_xfs,kmask_yis,kmask_yfs)):
-		print("rectangular mask:",np.round(xi,4),"<= x <=",np.round(xf,4),",",np.round(yi,4),"<= y <=",np.round(yf,4))
-		mask=np.ones((len(kxs),len(kys)))
-		mask[:,kys<yi]=0 ; mask[:,kys>yf]=0
-		mask[kxs<xi,:]=0 ; mask[kxs>xf,:]=0
-		masks.append(mask)
-		overplot.append({"kind":"line","xs":[xi,xi,xf,xf,xi],"ys":[yi,yf,yf,yi,yi]})
-		overplot.append({"kind":"text","xs":[(xi+xf)/2],"ys":[(yi+yf)/2],"text":[kmask_lbl[len(masks)-1]]})
-	for i,(cx,cy,r) in enumerate(zip(kmask_cxs,kmask_cys,kmask_rad)):
-		if isinstance(r,(float,int)):
-			print("circular mask: center = (",np.round(cx,4),",",np.round(cy,4),") , r = ",np.round(r,4)) ; r=[r]
-		else:
-			print("nested circular mask: center = (",np.round(cx,4),",",np.round(cy,4),") , r = ",[ np.round(v,4) for v in r])
-		mask=np.zeros((len(kxs),len(kys)))
-		radii=np.sqrt( (kxs[:,None]-cx)**2+(kys[None,:]-cy)**2 )
-		pm=1
-		for v in reversed(sorted(r)):
-			mask[radii<=v]=pm ; pm=(pm+1)%2 ; print(pm)
-		masks.append(mask)
-		for v in r:
-			xline=np.linspace(cx-v*.99,cx+v*.99,100) ; yline=np.sqrt(v**2-(xline-cx)**2)
-			overplot.append({"kind":"line","xs":list(xline)+list(xline[::-1]),"ys":list(cy+yline)+list(cy-yline),'c':'k'})
-		overplot.append({"kind":"text","xs":[cx],"ys":[cy],"text":[kmask_lbl[len(masks)-1]],'c':'k'})
+	# reading and grouping psi files (instead of ivib files) via psiFileNames assumes certain parameters depending on mode
+	if mode=="PZ":
+		global energyCenters ; energyCenters=np.load(outDirec+"/ws.npy")
+	if mode=="JACR":
+		global ts ; ts=np.arange(1e6)
 
-	lblkwargs={"horizontalalignment":"center","verticalalignment":"center","size":10}
-	for op in overplot:
-		if op["kind"]!="text":
-			continue
-		for k in lblkwargs:
-			op[k]=lblkwargs[k]
-	#print(overplot)
-	if preview:
-		print("PREVIEW MASKS")
-		for i,mask in enumerate(masks):
-			diff[mask==1]*=10000
-		contour(np.log(diff).T,kxs,kys,xlabel="$\AA$^-1",ylabel="$\AA$^-1",overplot=overplot,filename=outDirec+"/diffmasks.png")
-
-	return masks
-
-# maskDOS > layerDOS > eDOS > psifileToIvib > energyLoss
-def maskDOS():
-	infile=sys.argv[-1]
-	readInputFile(infile)
-	print(outDirec)
-
-	masks=processKmasks()
-
-	print("PROCESS EWAVES FOR MASKS")
-	#Xs=[] ; Ys=[]
-	for i,mask in enumerate(masks):
-		# layerDOS (layerDOS_maskname.png, layerDOS_maskname.txt) > eDOS (Ivib...png, eDOS...png)
-		X,Y=layerDOS(mask=mask,maskname=kmask_lbl[i])
-		#shutil.move(outDirec+"/postProcessDOS.txt",outDirec+"/postProcessDOS_"+str(i)+".txt")
-		picDirec=outDirec+"/Ivib_"+kmask_lbl[i]
-		os.makedirs(picDirec,exist_ok=True)
-		for f in glob.glob(outDirec+"/Ivib_*.png")+[outDirec+"/layerDOS_"+kmask_lbl[i]+".png",outDirec+"/layerDOS_"+kmask_lbl[i]+".txt"]+glob.glob(outDirec+"/eDOS_*.png"):
-			shutil.move(f,picDirec)
-		#plot(Xs,Ys,markers=rainbow(len(Xs)),title=kmask_lbl[i])
-
-	#Xs=[] ; Ys=[]
-	#ecdata=np.loadtxt(outDirec+"/energyMasks.csv",delimiter=",")
-	#energyCenters=ecdata[0,1:]
-
-	#for i in range(len(masks)):
-	#	data=np.loadtxt(outDirec+"/postProcessDOS_"+str(i)+".txt")
-	#	Xs.append(data[:,0]) ; Ys.append(data[:,-1])
-	
-	#plot(Xs,Ys,markers=rainbow(len(Xs)),filename=outDirec+"/maskedDOS.png",labels=kmask_lbl)
-
-# slopefit: y,x indices! for an intensity field z as a function of x and y, find the line that best bisects it (used for fitting on diffraction spots)
-# how does it work? "center of mass in x and in y" are easy: cx=np.sum(zs*xs[None,:])/np.sum(zs), which is simply "weight each value by it's distance in x" and so on. we're calculating the "moment" about zero, mass*distance. for slope, we first find the centers, then calculate the slope to each point from the center: slopes=(ys[None,:]-cy)/(xs[:,None]-cx) and the distance to each point l=np.sqrt((xs[:,None]-cx)**2+(ys[None,:]-cy)**2). then we weight the slopes by the mass and the distance from the center: m=np.sum(Ivib*slopes*l)/np.sum(Ivib*l)
-# try it yourself, here's a couple useful example distributions to try: 
-# zs=np.exp(-(xs[None,:]-ys[:,None])**2/2/2**2)*np.exp(-(ys[:,None]-5)**2/2/2**2) # for a slanted gaussian centered at 5,5
-# zs=np.exp(-((xs[None,:]+5)-2*ys[:,None])**2/2/2**2)*np.exp(-(ys[:,None]-5)**2/2/2**2) # same, but with a different slope
-def slopefit(zs,xs,ys,cx=None,cy=None):
-	if cx is None:
-		cx=np.sum(zs*xs[None,:])/np.sum(zs)
-	if cy is None:
-		cy=np.sum(zs*ys[:,None])/np.sum(zs)
-	xc=xs-cx ; yc=ys-cy
-	slopes=yc[:,None]/xc[None,xc!=0]
-	distances=np.sqrt(xc[None,:]**2+yc[:,None]**2)
-	m =np.sum(zs[:,xc!=0]*slopes*distances[:,xc!=0])/np.sum(zs[:,xc!=0]*distances[:,xc!=0])
-	islopes=xc[None,:]/yc[yc!=0,None]
-	im=np.sum(zs[yc!=0,:]*islopes*distances[yc!=0,:])/np.sum(zs[yc!=0,:]*distances[yc!=0,:])
-	overplot=[ {"xs":xs,"ys":m*(xs-cx)+cy,"kind":"line","c":"r","linestyle":":"},
-		{"xs":im*(ys-cy)+cx,"ys":ys,"kind":"line","c":"r","linestyle":":"} ]
-	contour(zs,xs,ys,overplot=overplot)
-	return m,cx,cy
-
-def kmaskCOG():
-	infile=sys.argv[-1]
-	readInputFile(infile)
-	print(outDirec)
-
-	masks=processKmasks(preview=False)
-	print(masks)
-
-	ecdata=np.loadtxt(outDirec+"/energyMasks.csv",delimiter=",")
-	global energyCenters
-	energyCenters=ecdata[0,1:]
-	npts=1 ; nLayers=1 ; layer=0 ; point=0
-	if CONVERGENCE!=0 and len(probePositions)>1:
-		npts=len(probePositions)
-	if layerwise!=0:
-		nLayers=int(open(outDirec+"/nLayers.txt").readlines()[0])
-	if nLayers>1:
-		layers=list(range(nLayers)) ; layer=layers[layer] ; print("layer",layer)# handle "-1" to denote "last layer"
-	kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")	
-
-	for e in tqdm(range(len(energyCenters))):
-		overplot=[]
-		for i,mask in enumerate(masks):
-			print(i,mask,mask.shape)
-			# psi_e9_[fp9]_[l8]_[p7].npy : fp ifof parallelFP=True, l ifof layerwise!=0, p ifof CONVERGENCE!=0 & len(probePositions)>1
-			if parallelFP:
-				psifile=outDirec+"/psi_e"+str(e) +\
-					{True:"_l"+str(layer),False:""}[nLayers>1] +\
-					{True:"_p"+str(point),False:""}[npts>1] +".npy"
-			else:
-				psifile=[ outDirec+"/psi_e"+str(e)+"_fp"+str(fp) +\
-					{True:"_l"+str(layer),False:""}[nLayers>1] +\
-					{True:"_p"+str(point),False:""}[npts>1] +".npy" 
-					for fp in range(numFP) ]
-			print("reading psi file",psifile)
-			Ivib=psifileToIvib(psifile,e) # EITHER process psifile(s) OR read in saved ivib file
-			Ivib*=mask
-			m,cx,cy=slopefit(Ivib.T,kxs,kys,cx=kmask_cxs[i],cy=kmask_cys[i])
-			# center of mass of disk:
-			#cx=np.sum(Ivib*kxs[:,None])/np.sum(Ivib) # prototyped in figs_abEELS_AlN_thiccc/COM.py
-			#cy=np.sum(Ivib*kys[None,:])/np.sum(Ivib)
-			# this isn't actually what we want to do? this will tell us the "offcenteredness" of the disks. 
-			# we want, like, a line through the disk at some angle like they do in https://arxiv.org/pdf/2407.08982
-			overplot.append({ "xs":kxs,"ys":m*(kxs-cx)+cy,"kind":"line","c":"r"})
-
-		Ivib=psifileToIvib(psifile,e)
-		for m in masks:
-			Ivib*=(10+m)
-		contour(Ivib.T,kxs,kys,xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[e])+" THz",overplot=overplot)#,zlim=zlim,cmap='Spectral')
-
-
-		#if plotDiffractions:
-		#kxs=np.load(outDirec+"/kxs.npy") ; kys=np.load(outDirec+"/kys.npy")
-		#zlim=max(abs(np.amin(Ivib)),abs(np.amax(Ivib))) ; zlim=[-zlim,zlim] ; print("ZLIM",zlim)
-		#contour(Ivib.T,kxs,kys,xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(energyCenters[e])+" THz",overplot=overplot)#,zlim=zlim,cmap='Spectral')
-
-
-		#xs.append(energyCenters[e]) ; ys.append(np.sum(Ivib))
-
-	
-	#print("PROCESS EWAVES FOR MASKS")
-	##Xs=[] ; Ys=[]
-	#for i,mask in enumerate(masks):
-	#	# layerDOS (layerDOS_maskname.png, layerDOS_maskname.txt) > eDOS (Ivib...png, eDOS...png)
-	#	X,Y=layerDOS(mask=mask,maskname=kmask_lbl[i])
-	#	#shutil.move(outDirec+"/postProcessDOS.txt",outDirec+"/postProcessDOS_"+str(i)+".txt")
-	#	picDirec=outDirec+"/Ivib_"+kmask_lbl[i]
-	#	os.makedirs(picDirec,exist_ok=True)
-	#	for f in glob.glob(outDirec+"/Ivib_*.png")+[outDirec+"/layerDOS_"+kmask_lbl[i]+".png",outDirec+"/layerDOS_"+kmask_lbl[i]+".txt"]+glob.glob(outDirec+"/eDOS_*.png"):
-	#		shutil.move(f,picDirec)
-
-
-# use settings restartFrom="..." and saveExitWave=True. the exit wave from one run will be used as the entrance wave (instead of a probe) for the next run, which will allow simulating infinitely-thick samples without needing to build out a ridiculously thick potential. 
-# BUT, this means a huge number of beam view images are created (annoying) and wave files are stored for each run (wastes space). 
-# here, we loop through all cycles, delete extra image files, and delete all but last two cycles' wave files
-def cycleCleanup():
-	infile=sys.argv[-1]
-	#readInputFile(infile) # oops! this will create the next folder! 
-	outDirec="figs_abEELS_"+infile.strip("/").split("/")[-1].split(".")[0]
-	print(outDirec)
-	direcs=[outDirec]
-	for i in range(100000):
-		if os.path.exists(outDirec+"_cycle"+str(i)):
-			ewaves=glob.glob(outDirec+"_cycle"+str(i)+"/ewave*.npy")
-			if len(ewaves)==50:
-				direcs.append(outDirec+"_cycle"+str(i))
-			#else:
-			#	print("ignore incomplete directory",outDirec+"_cycle"+str(i))
-			#	break
-		else:
-			break
-	print(direcs)
-	#return
-	for direc in direcs:
-		pics=glob.glob(direc+"/*beam*.png")+glob.glob(direc+"/*side.png")
-		print("remove",pics)
-		for p in pics:
-			os.remove(p)
-	# do not delete wave files out of the LAST folder (might want it later), or SECOND TO LAST (if last is still being generated, it might be operating out of the second-to-last
-	for i,direc in enumerate(direcs):
-		if i<len(direcs)-2:
-			wavefiles=glob.glob(direc+"/ewave_*.npy")
-			print("remove",wavefiles)
-			for w in wavefiles:
-				os.remove(w)
-
-# use settings restartFrom="..." and saveExitWave=True. the exit wave from one run will be used as the entrance wave (instead of a probe) for the next run, which will allow simulating infinitely-thick samples without needing to build out a ridiculously thick potential. 
-# This only works well for numFP=1, so you should run many for each different FP config, and then we'll combine them here
-def cycleCombiner():
-	#baseFPs=[ "AlN_"+l for l in "ABCDEFGHIJKLMNOPQRSTUVWXYZ" ] # YOU NEED TO EDIT THIS LINE TO POINT TO YOUR SHIT
-	#print(baseFPs)
-	inputFiles=sys.argv[2:]
-	names=[ f.split("/")[-1].replace(".txt","") for f in inputFiles ]
-	#for i in range(100000):
-	for i in [54]:
-		if i==0:
-			direcs=[ "figs_abEELS_"+n for n in names ]
-		else:
-			direcs=[ "figs_abEELS_"+n+"_cycle"+str(i-1) for n in names ]
-		if not os.path.exists(direcs[0]):
-			break
-		append="_l"+str(i)
-		print("CALLING psiCombiner:",direcs,append)
-		psiCombiner(direcs,append)
-
-def psiCombiner(direcs,append):
-	#append="_l4" ; direcs=sys.argv[2:]
-	#append=sys.argv[2] ; direcs=sys.argv[3:]
-	psifiles=[ glob.glob(d+"/psi*.npy") for d in direcs ] # each direc gets a list of psi files
-	os.makedirs("psiCombined",exist_ok=True)
-	for f1 in psifiles[0]: # loop through all files in first direc
-		name=f1.replace(direcs[0],"").replace("/","") # get file's name (excluding directory name)
-		outfile="psiCombined/"+name.replace(".npy",append+".npy")
-		if os.path.exists(outfile):
-			print("skip",name)
-			continue
-		selected=[ d+"/"+name for d in direcs ]
+	chunks=psiFileNames(prefix="psi")
+	print(chunks)
+	for fs in chunks:
 		psis=[]
-		for s in selected:
-			if os.path.exists(s):
-				psis.append(np.load(s))
-				print(s,np.shape(psis[-1]))
+		for f in fs: # either psi_e or psi_t, either loop through energy, or time chunks
+			psi=np.load(f) 
+			if len(np.shape(psi))==2:
+				psis.append(psi)
 			else:
-				print("WARNING: missing psi file",s)
-		psi=np.asarray(psis)
-		print(name,np.shape(psi))
-		np.save(outfile,psi)
+				for p in psi:	# for each energy or timechunk, loop through individual FP configs, or individual timesteps. 
+					psis.append(p)
+		fo=fs[0].replace("_t0","").replace("_e0","").replace(".npy","").replace("psi","diff")
+		diff=np.sum(np.absolute(psis),axis=0)
+		np.save(fo+".npy",diff)
+		contour(np.log(diff).T,kxs,kys,filename=fo+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="diffraction image")#,zlim=zlim,cmap='Spectral')
+			#contour(np.log(np.absolute(sliced)),kxs,ws)
 
-def fakePhononCycles():
-	infile=sys.argv[-1]
-	readInputFile(infile)
-	lines=open(infile,'r').readlines()+["\n"]*4 # add dummy lines so we can set appropriate variables
-	newinfile=infile.replace(".txt","-edited.txt")
+# python3 inputs/infile1.txt outputs/outdirec1 outputs/outdirec2 outputs/outdirec3...
+# we will create a new output direc and stack up all like psi files
+# def combinePZruns():
+#	
 
-	phases=np.linspace(0,2*np.pi,numPhases,endpoint=False)	
-	for i,p in enumerate(phases):
-		print("RUNNING FOR PHASE",p)
+# python3 inputs/infile1.txt
+# we will create a new output direc and copy in and rename psi and ivib files (saveExitWave=True ; restartFrom="AlN_0m_01" ; numCycles=15 ; deleteInputWave=True) run over and over again will use one run's exit waves as the probe for subsequent runs, providing the ability to simulate super-thick volumes. we need to collect up the files from each cycle and rename them: e.g. "psi_e9_[p7].npy" ; "psi_t0_[p7].npy" ; "ivib_[p7].npy" --> "psi_e9_[l8]_[p7].npy" ; "psi_t0_[l8]_[p7].npy" ; "ivib_[l8]_[p7].npy"
+def cyclesToLayers():
 
-		# EDIT LINES OF INPUT FILE
-		lines[-2]="numFP=1 ; parallelFP=False ; offsetFP=0 \n"
-		#lines[22]='addModes={"A":['+A+'],"w":[0],"k":['+iA+'*2*np.pi],"pdirec":[[1,1,0]],"vdirec":[[1,1,0]],"phase":['+str(p)+']}\n'
-		addModes["phase"]=[p+pr for pr in addModes["phase_rel"]]
-		lines[-1]="addModes="+str(addModes)+"\n"
+	importPositions()	# reads in globals: velocities,ts,types,avg,disp
+	preprocessPositions()	# handles trimming/rotation, but NOT tiling
 
-		# SAVE OFF INPUT FILE
-		with open(newinfile,'w') as f:
-			for l in lines:
-				f.write(l)
-		# RUN NEW INPUT FILE
-		sys.argv[-1]=newinfile
-		main()
-		# COPY OFF RESULTS
-		os.makedirs(outDirec+"/FPs",exist_ok=True)
-		shutil.copy(outDirec+"/psi_e0_fp0.npy",outDirec+"/FPs/psi_e0_fp"+str(i)+".npy")
-		shutil.copy(outDirec+"/0_beam.png",outDirec+"/FPs/"+str(i)+".png")
-		os.makedirs(outDirec+"/phase"+str(i),exist_ok=True)
-		files=glob.glob(outDirec+"/*") ; print("MOVING",files)
-		files=[ f for f in files if "phase" not in f and "FP" not in f ]
-		for f in files:
-			shutil.move(f,outDirec+"/phase"+str(i)+"/")
-	# COPY FP CONFIGS BACK OUT TO MAIN OUTPUT FOLDER AND RENAME. ALSO COPY REQUIRED FILES FOR IVIB
-	for i,p in enumerate(phases):
-		shutil.copy(outDirec+"/phase"+str(i)+"/psi_e0_fp0.npy",outDirec+"/psi_e0_fp"+str(i)+".npy")
-		shutil.copy(outDirec+"/phase"+str(i)+"/0_beam.png",outDirec+"/"+str(i)+"_beam.png")
-	for f in ["energyMasks.csv","kxs.npy","kys.npy"]:
-		shutil.copy(outDirec+"/phase0/"+f,outDirec+"/"+f)
+	# CREATE NEW OUTPUT DIRECTORY
+	print(outDirec)
+	newDirec=outDirec+"_combined"
+	os.makedirs(newDirec,exist_ok=True)
 
-	# EDIT LINES OF INPUT FILE, FOR FULL NUMBER OF FP CONFIGS
-	lines[-2]="numFP="+str(numPhases)+" ; parallelFP=False ; offsetFP=0 \n"
-	with open(newinfile,'w') as f:
-		for l in lines:
-			f.write(l)
-	# RUN DOS
-	eDOS()
+	# GATHER UP FILES FROM INDIVIDUAL RUNS
+	# reading and grouping psi files (instead of ivib files) via psiFileNames assumes certain parameters depending on mode
+	if mode=="PZ":
+		global energyCenters ; energyCenters=np.load(outDirec+"/ws.npy")
+	if mode=="JACR":
+		global ts ; ts=np.arange(1e6)
 
-def cycle():			# use settings restartFrom="..." and saveExitWave=True. the exit wave from one run will be used as the entrance
-	while True:	 	# wave (instead of a probe) for the next run, which will allow simulating infinitely-thick samples without 
-		main()		# needing to build out a ridiculously thick potential
+	outDirecs=[ outDirec ] + [ outDirec+"_cycle"+str(i) for i in range(numCycles) ]
 
-funcAliases={"pre":"preprocessOutputs","DOS":"eDOS","cc":"cycleCleanup"}
+	chunks=psiFileNames(prefix="psi")
+
+	# COPY THEM IN (or use symlinks to avoid using so much space?)
+	for l,OD in enumerate(outDirecs): # ["outputs/AlN_0m_01","outputs/AlN_0m_01_cycle0","outputs/AlN_0m_01_cycle1","outputs/AlN_0m_01_cycle2"...]
+		# e.g. [[ "outputs/AlN_0m_01/psi_t0_p0.npy","outputs/AlN_0m_01/psi_t10_p0.npy","outputs/AlN_0m_01/psi_t20_p0.npy"...],[ "outputs/AlN_0m_01/psi_t0_p1.npy","outputs/AlN_0m_01/psi_t10_p1.npy","outputs/AlN_0m_01/psi_t20_p1.npy"...]...]
+		for chunk in chunks: 
+			for f in chunk: # e.g. "outputs/AlN_0m_01/psi_t98_p0.npy" or "outputs/AlN_0m_01/psi_t98.npy"
+				pieces=f.replace(".npy","").split("_") # e.g. [..."01/psi","t98","p0"] or [..."01/psi","t98.npy"]
+				if "t" in pieces[-1]: # no "p0"
+					pieces.append("l"+str(l))
+				else:
+					pieces.insert(-1,"l"+str(l))
+				fo="_".join(pieces)+".npy"
+				f=f.replace(outDirec,OD)
+				fo=fo.replace(outDirec,newDirec)
+				#f=f.replace("
+				print(f,"-->",fo)
+				#shutil.copy(f,fo)
+				if os.path.exists(fo):
+					continue
+				os.symlink("../../"+f,fo)
+
+	# CREATE DUMMY INPUT FILE FOR COMBINED FOLDER (turn off restartFrom and numCycles, add layerwise, create new layers.npy file)
+	lines=open(sys.argv[-1]).readlines()
+	filtered=[]
+	for l in lines:
+		if "restartFrom" in l or "numCycles" in l:
+			l="# "+l
+		filtered.append(l)
+	filtered.append("\nlayerwise=2\n")
+	newInputFile=sys.argv[-1].replace(".txt","_combined.txt")
+	with open(newInputFile,'w') as fo:
+		for l in filtered:
+			fo.write(l)
+
+	layers=np.arange(numCycles+1)*nz*c
+	np.save(newDirec+"/layers.npy",layers)
+	
+	for otherfile in ["ws.npy","kxs.npy","kys.npy"]:
+		shutil.copy(outDirec+"/"+otherfile,newDirec)
+	
+	print("PLEASE RUN \"python3 abEELS.py "+newInputFile+"\" before attempting any post-processing (this creates required ivib files)")
+	#print("YOU MAY NOW RUN POST-PROCESSING ON COMBINED RUN: e.g. \"python3 DOS inputs/"+sys.argv[-1].replace(".txt","_combined.txt")+"\"")
+
+funcAliases={"DOS":"eDOS"}
 # if called directly, run main(). does not run if imported "from abEELS import *"
 if __name__=='__main__':
+
+	infile=sys.argv[-1]
+	readInputFile(infile)
+
 	if len(sys.argv)==2:
-		main()
+		if mode=="JACR":
+			main_JACR()
+		else:
+			main_PZ()
 	else:
 		fun=sys.argv[1] 
 		if fun in funcAliases:
 			fun = funcAliases[ fun ]
-		c=fun+"()"
-		exec(c)
-
-	#elif sys.argv[1]=="pre":
-	#	preprocessOutputs()
-	#elif sys.argv[1]=="DOS":
-	#	eDOS()
-	#elif sys.argv[1]=="layerDOS":
-	#	layerDOS()
-	#elif sys.argv[1]=="maskDOS":
-	#	maskDOS()
-	#elif sys.argv[1]=="cycle":
-	#	while True:
-	#		main()
-	#elif sys.argv[1]=="cc":
-	#	cycleCleanup()
-	#elif sys.argv[1]=="psiCombiner":	# if you run "python3 abEELS.py psiCombiner figs_abEELS_AlN_*_cycle0", bash will explode out the "*"
-	#	psiCombiner()			# before passing to python! then we'll combine like-files from each
-	#elif sys.argv[1]=="cycleCombiner":
-	#	cycleCombiner()
-	#elif sys.argv[1]=="fakePhononCycles":
-	#	fakePhononCycles()
+		command=fun+"()"
+		exec(command)
