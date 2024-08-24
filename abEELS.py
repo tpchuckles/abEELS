@@ -156,10 +156,10 @@ def readInputFile(infile):
 	# Note no skewed primitive cells are currently supported for tiling
 	global path, dumpfile, dumptype, useLattice, atomTypes, nx, ny, nz, a, b, c ,dt, trim, beamAxis, flipBeam, tile, maxFreq
 	global semiAngle, outDirec, probePositions, saveExitWave, restartFrom, restartDirec, addModes, modifyProbe, modifyAtoms, numFP , slice_thickness
-	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl,deleteInputWave, cycleID , calculateForces
+	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl,deleteInputWave, cycleID
 	global concurrentTimesteps, maxTimestep ; concurrentTimesteps=10 ; maxTimestep=1000 ; numFP=1 ; deleteInputWave=False ; slice_thickness=1
 	kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl=[],[],[],[],[],[],[],[]
-	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False ; modifyProbe=False ; modifyAtoms=False ; cycleID=0 ; calculateForces=False
+	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False ; modifyProbe=False ; modifyAtoms=False ; cycleID=0
 	saveExitWave=False ; restartFrom=False ; maxFreq=None
 	lines=open(infile,'r').readlines()
 	exec("".join(lines),globals())
@@ -561,11 +561,6 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 		print("delete previous input wave file")
 		os.remove(restartDirec+"/ewave_"+fileSuffix+".npy")
 	#return zr # even if layerwise!=0, we'll end up with the last (thickest) psi. 
-
-
-	if calculateForces:
-		zs=np.asarray( [0]+list(layers) )
-		electronForces(matstrip(exit_waves.array),xs,ys,zs,fileSuffix)
 
 # END SHARED FUNCTIONS
 
