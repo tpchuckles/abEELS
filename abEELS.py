@@ -154,13 +154,13 @@ def readInputFile(infile):
 	# READ IN THE FOLLOWING VARIABLES FROM THE INPUT FILE
 	# path,dumpfile,atomTypes,nx,ny,nz,a,b,c,dt,trim,beamAxis,flipBeam,tiling,semiAngle
 	# Note no skewed primitive cells are currently supported for tiling
-	global path, dumpfile, dumptype, useLattice, atomTypes, nx, ny, nz, a, b, c ,dt, trim, beamAxis, flipBeam, tile
-	global semiAngle, outDirec, probePositions, saveExitWave, restartFrom, restartDirec, addModes, modifyProbe, numFP
-	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl,deleteInputWave, cycleID
-	global concurrentTimesteps, maxTimestep ; concurrentTimesteps=10 ; maxTimestep=1000 ; numFP=1 ; deleteInputWave=False
+	global path, dumpfile, dumptype, useLattice, atomTypes, nx, ny, nz, a, b, c ,dt, trim, beamAxis, flipBeam, tile, maxFreq
+	global semiAngle, outDirec, probePositions, saveExitWave, restartFrom, restartDirec, addModes, modifyProbe, modifyAtoms, numFP , slice_thickness
+	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl,deleteInputWave, cycleID , calculateForces
+	global concurrentTimesteps, maxTimestep ; concurrentTimesteps=10 ; maxTimestep=1000 ; numFP=1 ; deleteInputWave=False ; slice_thickness=1
 	kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl=[],[],[],[],[],[],[],[]
-	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False ; modifyProbe=False ; cycleID=0
-	saveExitWave=False ; restartFrom=False
+	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False ; modifyProbe=False ; modifyAtoms=False ; cycleID=0 ; calculateForces=False
+	saveExitWave=False ; restartFrom=False ; maxFreq=None
 	lines=open(infile,'r').readlines()
 	exec("".join(lines),globals())
 	kmask_lbl=kmask_lbl+[ str(v) for v in range(len(kmask_xis)+len(kmask_cxs)-len(kmask_lbl)) ]
@@ -227,6 +227,7 @@ def importPositions():
 		if useLattice:
 			print("OVERWRITING AVERAGE POSITIONS FROM LATTICE FILE:",useLattice)
 			avg,typ=scrapePos(path+useLattice)
+			disp*=0
 	elif dumptype=="positions":
 		print("reading positions from pos file")
 		pos,types=scrapePos(path+dumpfile) # qdump positions,velocities are [nt,na,3]. avg is [na,3] and disp is [nt,na,3]
@@ -256,9 +257,34 @@ def importPositions():
 	if "A" in addModes.keys(): # addModes={"THz":[...],"iA":[...],"pdirec":[...],"vdirec":[...],"phase":[...]}
 		for i in range(len(addModes["A"])):
 			A,k,w,p,v,phi=[ addModes[key][i] for key in ["A","k","w","pdirec","vdirec","phase"] ]
-			print("add ",A,"*","sin(",k,"*","xyz[",p,"]","+",phi,")")
-			added=addWave(A,k,phi,p,v)
-			avg[:,:]+=added[:,:]
+			print("add wave A:",A,"k",k,"w",w,"x",p,"phi",phi)
+			addWave(A,k,w,phi,p,v)
+			#avg[:,:]+=added[:,:]
+			#disp[:
+
+def addWave(A,k,w,phi,p_xyz,v_xyz):
+	na=len(avg)
+	nt={"PZ":len(disp),"JACR":maxTimestep}[mode] # add to ALL timesteps for PZ method, since snapshots are taken randomly. only add to first N for JACR method (no point adding to the timesteps we don't even use. just wastes computation time)
+	# VECTOR MATH RIPPED STRAIGHT OUTA lammpsScapers.py > SED()
+	if isinstance(p_xyz,(int,float)): # 0,1,2 --> x,y,z
+		xs=avg[:,p_xyz] # a,xyz --> a
+	else:	# [1,0,0],[1,1,0],[1,1,1] and so on
+		# https://math.stackexchange.com/questions/1679701/components-of-velocity-in-the-direction-of-a-vector-i-3j2k
+		# project a vector A [i,j,k] on vector B [I,J,K], simply do: A•B/|B| (dot, mag)
+		# for at in range(na): x=np.dot(avg[at,:],p_xyz)/np.linalg.norm(p_xyz)
+		# OR, use np.einsum. dots=np.einsum('ij, ij->i',listOfVecsA,listOfVecsB)
+		p_xyz=np.asarray(p_xyz)
+		d=p_xyz[None,:]*np.ones((na,3)) # xyz --> a,xyz
+		xs=np.einsum('ij, ij->i',avg[:,:],d) # pos • vec, all at once
+		xs/=np.linalg.norm(p_xyz)
+	if isinstance(v_xyz,(int,float)):
+		vs=np.zeros(3)
+		vs[v_xyz]=1
+	else:
+		vs=v_xyz/np.sqrt(np.sum(np.asarray(v_xyz)**2))
+	for ijk in range(3):
+		disp[:nt,:,ijk]+=vs[ijk]*A*np.sin(k*xs[None,:]*2*np.pi+phi+w*ts[:nt,None]*dt*2*np.pi)
+
 
 # TRIM, TILE, ROTATE, FLIP
 #trim=[[],[],[]] # add two values (unit cell counts) to any dimension to trim to that size
@@ -301,6 +327,9 @@ def preprocessPositions():
 		avg[:,2]*=-1 ; avg[:,2]+=nz*c # # na,[x,y,z], flip z, shift position
 		disp[:,:,2]*=-1 # # nt,na,[x,y,z], no shift for displacements or velo
 		velocities[:,:,2]*=-1
+
+	if modifyAtoms:
+		modifyAtoms()
 
 def matstrip(ary): # strip all len==1 indices out of an N-D array. shape 2,1,3,4,1,7 turns into shape 2,3,4,7. useful for getting rid of spurious axes
 	shape=np.asarray(np.shape(ary))
@@ -350,15 +379,19 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 	# STEP 1.b CREATE POTENTIAL
 	print("setting up wave sim")
 	box=np.asarray(atomStack[0].cell).flat[::4] ; print("cell size: ",box)
-	potential_phonon = abtem.Potential(frozen_phonons, sampling=.05) #,slice_thickness=.01) # default slice thickness is 1Å
+	potential_phonon = abtem.Potential(frozen_phonons, sampling=.05,slice_thickness=slice_thickness) # default slice thickness is 1Å
+	xs=np.linspace(0,potential_phonon._grid.extent[0],potential_phonon._grid.gpts[0],endpoint=False)
+	ys=np.linspace(0,potential_phonon._grid.extent[1],potential_phonon._grid.gpts[1],endpoint=False)
+	if not os.path.exists(outDirec+"/xs.npy"):
+		np.save(outDirec+"/xs.npy",xs) ; np.save(outDirec+"/ys.npy",ys)
 	nLayers=1
 	if layerwise!=0:
 		nslices=potential_phonon.num_slices # 14.5 Å --> potential divided into 33 layers
 		nth=nslices//layerwise # 33 layers, user asked for 10? 33//10 --> every 3rd layer --> 11 layers total. 
 		nth=max(nth,1)		# user asked for 1000? 33//1000 --> 0! oops! just give them every layer instead. 
-		potential_phonon = abtem.Potential(frozen_phonons, sampling=.05,exit_planes=nth)#,slice_thickness=.01) # default slice thickness is 1Å
+		potential_phonon = abtem.Potential(frozen_phonons, sampling=.05,exit_planes=nth,slice_thickness=slice_thickness) # default slice thickness is 1Å
 		nLayers=potential_phonon.num_exit_planes
-		layers=np.arange(nLayers)*nth ; np.save(outDirec+"/layers.npy",layers) # TODO not 100% sure these are truly the plane locations
+		layers=np.cumsum(potential_phonon._slice_thickness) ; np.save(outDirec+"/layers.npy",layers) # TODO not 100% sure these are truly the plane locations
 		print("potential sliced into",nslices,"slices. keeping every",nth,"th layer, we'll have",nLayers,"exit waves")
 		#with open(outDirec+"/nLayers.txt",'w') as f:
 		#	f.write(str(nLayers))
@@ -400,14 +433,15 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 		print("scan positions:",custom_scan.get_positions())
 		npts=len(custom_scan.get_positions())
 
-		if modifyProbe: # your input file can define a function which does an in-plane modify of the complex probe function! 
+		if modifyProbe: # your input file can define a function which does an in-place modify of the complex probe function! 
 			probewave=probe.build(custom_scan).compute()
 			Z=probewave.array ; nx,ny=np.shape(Z)
 			LX,LY=probe.extent
 			xs=np.linspace(-LX/2,LX/2,nx) ; ys=np.linspace(-LY/2,LY/2,ny)
-			modifyProbe(Z,xs,ys)
+			modifyProbe(Z,xs,ys) # TODO WHY IS OUR PROBE BEING AFFECTED BY THE POTENTIAL? see hBN_0m_04
 			contour(np.real(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png")
 			contour(np.imag(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png")
+
 	else: # PLANE WAVE INSTEAD OF CONVERGENT PROBE (just define the plane wave params)
 		plane_wave = abtem.PlaneWave(energy=100e3, sampling=0.05)
 
@@ -474,12 +508,18 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 	# OUTPUTTING: for any indices that are length 1, we get rid of them, via matstrip(). this means we can then fall back to variables npts, nLayers, and parallelFP to decide the dimensionality of whatever we're exporting and importing. any time npts>1 for example, we will loop through points and save each point's psi function separately. same goes for nLayers. only FPs are saved together.
 
 	if saveExitWave:
+		print("saveExitWave=True:",np.shape(exit_waves.array))
 		for l in range(nLayers):
 			for p in range(npts): # for psi, we do: psi_e9_[fp9]_[l8]_[p7].npy,
 				wavefile=outDirec+"/ewave_"+fileSuffix +\
 					{True:"_l"+str(l),False:""}[nLayers>1] +\
 					{True:"_p"+str(p),False:""}[npts>1] + ".npy"
-				np.save(wavefile,matstrip(exit_waves.array))
+				waveout=exit_waves.array
+				if nLayers>1:
+					waveout=waveout[:,l,:,:]
+				if npts>1:
+					waveout=waveout[:,p,:,:]
+				np.save(wavefile,matstrip(waveout))
 
 	# STEP 5 CONVERT TO DIFFRACTION SPACE
 	print("converting exit wave to k space",end=" ")
@@ -521,6 +561,11 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 		print("delete previous input wave file")
 		os.remove(restartDirec+"/ewave_"+fileSuffix+".npy")
 	#return zr # even if layerwise!=0, we'll end up with the last (thickest) psi. 
+
+
+	if calculateForces:
+		zs=np.asarray( [0]+list(layers) )
+		electronForces(matstrip(exit_waves.array),xs,ys,zs,fileSuffix)
 
 # END SHARED FUNCTIONS
 
@@ -706,7 +751,33 @@ def sliceE(nth=1):
 		for i in tqdm(range(len(ws))):
 			if i%nth!=0:
 				continue
-			contour(np.absolute(psi[i]).T,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(ws[i])+" THz")#,zlim=zlim,cmap='Spectral')
+			if (maxFreq is not None) and ( ws[i]>maxFreq or ws[i]<-1*maxFreq ):
+				continue	
+			contour(np.absolute(psi[i]).T,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(ws[i])+" THz",aspect=1)#,zlim=zlim,cmap='Spectral')
+
+def sliceE2(nth=1):
+	ws=np.load(outDirec+"/ws.npy")
+	kxs=np.load(outDirec+"/kxs.npy")
+	kys=np.load(outDirec+"/kys.npy")
+	os.makedirs(outDirec+"/slices2",exist_ok=True)
+
+	chunks=psiFileNames(prefix="ivib")
+	print(chunks)
+	for fs in chunks:
+		psi=np.load(fs[0])
+		fo=fs[0].split("/") ; fo.insert(2,"slices2") ; fo="/".join(fo) # outputs/inputfilename/ivib.npy --> outputs/inputfilename/slices/ivib.npy
+		for i in tqdm(range(len(ws))):
+			if i%nth!=0:
+				continue
+			if ws[i]<0:
+				continue
+			if (maxFreq is not None) and ( ws[i]>maxFreq or ws[i]<-1*maxFreq ):
+				continue
+			n=np.argmin(np.absolute(ws+ws[i]))
+			p=np.absolute(psi[i])+np.absolute(psi[n])
+			contour(p.T,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(ws[i])+" THz",aspect=1)#,zlim=zlim,cmap='Spectral')
+
+
 
 #           | (1)	take a 2D slice out of the E,kx,ky data cube to get
 #           o      (2)	ω vs k. arguments m, xi, yi define the slice via
@@ -719,7 +790,22 @@ def sliceE(nth=1):
 #     .'    |   	(3) m=0 xi=0 yi=4/a would be an offset horizontal slice,
 #   .'      o   	    where selectivity rules will show T modes only in
 #           |  		    the first BZ.
-def dispersion():
+def loopDispersions():
+	lines=open(outDirec+"/dispersions/dispersions.txt")
+	global m,xi,yi,xlim,ylim,title
+	for l in lines:
+		l=l.lstrip("#").strip()
+		exec(l,globals())
+		dispersion(m,xi,yi,xlim,ylim,title)
+	# how does this work? copy and past something like below into a "dispersions.txt" file and we'll loop through each line
+	# m=0      ; xi=0   ; yi=2/b ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] ; title="Xo" 	# AlN, Xo
+	# m=0      ; xi=0   ; yi=0   ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] ; title="Xc" 	# AlN, Xc
+	# m=np.inf ; xi=0   ; yi=0   ; xlim=[0,6/a] ; ylim=[0,6/b]          ; title="Mc" 	# AlN, Xc
+	# m=np.inf ; xi=2/a ; yi=0   ; xlim=[0,6/a] ; ylim=[0,6/b]          ; title="Mo" 	# AlN, Xc
+
+def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None):
+	os.makedirs(outDirec+"/dispersions",exist_ok=True)
+	
 	global a,b,c
 	# copied from preprocessPositions, since we need lattice parameters a,b,c to line up with our diffraction pattern
 	if beamAxis!=2: # default is to look down z, so we need to flip axes if we want to look down a different direction
@@ -727,12 +813,16 @@ def dispersion():
 		a,b,c=np.roll([a,b,c],rollby)
 	#print(a,b,c) ; sys.exit()
 
-	# TODO hardcoding linescan here, but should figure out a way to make them passable via command-line args or something
-	# m=0 ; xi=0 ; yi=4/b ; xlim=[0,12/a] ; ylim=[-np.inf,np.inf] 		# Si, Xo
-	m=0 ; xi=0 ; yi=0 ; xlim=[0,12/a] ; ylim=[-np.inf,np.inf] 		# Si, Xc
-	m=1 ; xi=0 ; yi=0 ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] 		# Si, Kc
-	m=1 ; xi=-2/a ; yi=2/b ; xlim=[-2/a,4/a] ; ylim=[-np.inf,np.inf] 	# Si, Ko
-	#m=0 ; xi=0 ; yi=2/b ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] # for AlN
+	if m is None:
+		# TODO hardcoding linescan here, but should figure out a way to make them passable via command-line args or something
+		#m=0 ; xi=0 ; yi=4/b ; xlim=[0,12/a] ; ylim=[-np.inf,np.inf] ; title="Xo"	# Si, Xo
+		#m=0 ; xi=0 ; yi=0 ; xlim=[0,12/a] ; ylim=[-np.inf,np.inf] ; title="Xc"		# Si, Xc
+		#m=1 ; xi=0 ; yi=0 ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] ; title="Kc" 		# Si, Kc
+		#m=1 ; xi=-2/a ; yi=2/b ; xlim=[-2/a,4/a] ; ylim=[-np.inf,np.inf] ; title="Ko"	# Si, Ko
+		#m=0 ; xi=0 ; yi=2/b ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] ; title="Xo" 	# AlN, Xo
+		m=0 ; xi=0 ; yi=0 ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] ; title="Xc" 		# AlN, Xc
+		#m=np.inf ; xi=0 ; yi=0 ; xlim=[0,6/a] ; ylim=[0,6/b] 	; title="Mc" 		# AlN, Xc
+		#m=np.inf ; xi=2/a ; yi=0 ; xlim=[0,6/a] ; ylim=[0,6/b] 	; title="Mo" 	# AlN, Xc
 
 	#psi=np.load(outDirec+"/ivib.npy")
 	ws=np.load(outDirec+"/ws.npy")
@@ -762,6 +852,13 @@ def dispersion():
 		diff=np.load(outDirec+"/diff"+filelabel+".npy")
 		#print(np.amax(psi),np.nanmax(psi),np.amin(psi),np.nanmin(psi))
 
+		if maxFreq is not None:
+			psi=psi[ws<=maxFreq] ; ws=ws[ws<=maxFreq]
+			psi=psi[ws>=-maxFreq] ; ws=ws[ws>=-maxFreq]
+
+		psi[ws>=0]*=ws[ws>=0,None,None]
+		psi[ws<0]*=-1*ws[ws<0,None,None]
+
 		overplot={"xs":[],"ys":[],"kind":"line","color":"r","linestyle":":"} 
 		sliced=[] ; ks=[]
 		for n,ij in enumerate(tqdm(ijs)):
@@ -778,8 +875,8 @@ def dispersion():
 		sliced=np.absolute(sliced)
 		sliced[sliced==0]=np.amin(sliced[sliced>0])
 		#print(np.amax(sliced),np.amin(sliced))
-		contour(np.log(diff).T,kxs,kys,filename=outDirec+"/disp_linescan"+filelabel+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="dispersion masked diffraction image",overplot=[overplot])
-		contour(np.sqrt(sliced).T,ks,ws,xlabel="k ($\AA$^-1)",ylabel="frequency (THz)",title="dispersion",filename=outDirec+"/dispersion"+filelabel+".png") # i prefer sqrt scale to log scale, as it sort of "equalizes" big numbers
+		contour(np.log(diff).T,kxs,kys,filename=outDirec+"/dispersions/"+title+"_disp_linescan"+filelabel+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="dispersion masked diffraction image",overplot=[overplot],)
+		contour(np.sqrt(sliced).T,ks,ws,xlabel="k ($\AA$^-1)",ylabel="frequency (THz)",title="dispersion",filename=outDirec+"/dispersions/"+title+"_dispersion"+filelabel+".png") # i prefer sqrt scale to log scale, as it sort of "equalizes" big numbers
 
 def diffraction():
 	kxs=np.load(outDirec+"/kxs.npy")
@@ -808,6 +905,22 @@ def diffraction():
 		np.save(fo+".npy",diff)
 		contour(np.log(diff).T,kxs,kys,filename=fo+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="diffraction image")#,zlim=zlim,cmap='Spectral')
 			#contour(np.log(np.absolute(sliced)),kxs,ws)
+
+def nukeHighFreqs(maxF=50):
+	ws=np.load(outDirec+"/ws.npy")
+	#print(ws)
+	mask=np.ones(len(ws))
+	mask[ws>maxF]=0
+	mask[ws<-1*maxF]=0
+	vibes=glob.glob(outDirec+"/ivib*.npy")
+	for f in vibes:
+		print(f)
+		ivib=np.load(f)
+		ivib=ivib[mask==1]
+		np.save(f,ivib)
+	print("ws")
+	ws=ws[mask==1]
+	np.save(outDirec+"/ws.npy",ws)
 
 # python3 inputs/infile1.txt outputs/outdirec1 outputs/outdirec2 outputs/outdirec3...
 # we will create a new output direc and stack up all like psi files
