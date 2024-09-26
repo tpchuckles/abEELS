@@ -2,23 +2,37 @@ import numpy as np
 import glob,os
 from tqdm import tqdm
 
-def scrapeLayers(filename):
-	ts=[] ; Ts=[] ; X=[]
-	f=open(filename, 'r')
-	while True:
-		l=f.readline()
-		if not l:		# EOF
+def scrapePos(filename):
+	lines=open(filename,'r').readlines()
+	for i,l in enumerate(lines):
+		if len(l.split(" "))==6:
 			break
-		if l[0]=="#":		# commented line (ignore)
-			continue
-		elif l[0]!=" ":		# line contains timestep number
+	data=np.loadtxt(filename,delimiter=" ",skiprows=i)
+	#print(data)
+	pos=data[:,3:] ; types=data[:,2].astype(int)
+	return pos,types
+
+def scrapeLayers(filename):		# # Chunk-averaged data for fix flux_m2 and group all	# comments
+	ts=[] ; Ts=[] ; X=[]		# # Timestep Number-of-chunks Total-count
+	f=open(filename, 'r')		# # Chunk Coord1 Ncount temp
+	while True:			# 16020050 240 12000					# line containing timestep number
+		l=f.readline()		#   1 0.679661 50 0
+		if not l: 	# EOF	#   2 2.03898 50 0
+			break		#   3 3.39831 76 -0.00920895
+		if l[0]=="#": # comment	#   4 4.75763 48 -0.00131646
+			continue	#   5 6.11695 46 0.00744407
+		elif l[0]!=" ":	# step	#   6 7.47627 53 -0.0087254
 			l=l.split()
 			ts.append(int(l[0])) ; Ts.append([])
-		else:			# line contains layer index, position and temperature
+		else:			# line contains: layer ID, position, Natoms/chunk , Temperature
 			l=l.split()
+			if len(l)!=4:
+				continue
 			Ts[-1].append(float(l[3]))
 			if len(Ts)==1:
 				X.append(float(l[1]))
+	if len(Ts[-1])!=len(Ts[0]): # partial line, incomplete run
+		Ts=Ts[:-1] ; ts=ts[:-1]
 	print("(numpy-izing)")
 	return np.asarray(Ts),np.asarray(X),np.asarray(ts)
 
@@ -37,11 +51,19 @@ def scrapeOutput(filename,columnNames=""):
 			for i in range(min(roundIDs)-1,max(roundIDs)):
 				data.append({})		# same datastructure as if we were reading in the output file fresh: one dict per thermo/run
 				for n in columnNames:
-					if "out_"+n+"_"+str(i+1)+".txt" in exported: # if the file exists, include it in the dict
-						data[-1][n]=[]
-						out=np.loadtxt("out_"+n+"_"+str(i+1)+".txt")
-						data[-1]["Step"]=out[:,0]
-						data[-1][n]=out[:,1]
+					# OOPS, THIS FAILS IF YOU CALL FROM ANOTHER DIRECTORY, AND FILES IN 'exported' HAVE DIRECTORY PREPENDED
+					#if "out_"+n+"_"+str(i+1)+".txt" in exported: # if the file exists, include it in the dict
+					#	data[-1][n]=[]
+					#	out=np.loadtxt("out_"+n+"_"+str(i+1)+".txt")
+					#	data[-1]["Step"]=out[:,0]
+					#	data[-1][n]=out[:,1]
+					for f in exported:
+						if "out_"+n+"_"+str(i+1)+".txt" in f:
+							data[-1][n]=[]
+							out=np.loadtxt(f)
+							data[-1]["Step"]=out[:,0]
+							data[-1][n]=out[:,1]
+
 			return data
 
 	f=open(filename,'r') ; readingData=False ; data=[]
@@ -140,16 +162,20 @@ def scrapeDump(filename,trange=":",arange="::1"):
 	np.save(filename+"_t.npy",timesteps) ; np.save(filename+"_p.npy",pos)
 	return pos,np.asarray(timesteps) # [nS,nA,xyz]
 
-def qdump(filename,timescaling=1,convert=True): # OBSCENELY FAST IN COMPARISON TO scrapeDump()
-	if os.path.exists(filename+"_t.npy"):
+def qdump(filename,timescaling=1,convert=True,safemode=False): # OBSCENELY FAST IN COMPARISON TO scrapeDump()
+	if os.path.exists(filename+"_ts.npy"):
 		print("ignoring qdump, reading npy files instead")
-		ts=np.load(filename+"_t.npy")
-		pos=np.load(filename+"_p.npy")
-		vel=np.load(filename+"_v.npy")
-		return pos,vel,ts
+		ts=np.load(filename+"_ts.npy")
+		pos=np.load(filename+"_pos.npy")
+		vel=np.load(filename+"_vel.npy")
+		types=np.load(filename+"_typ.npy")
+		return pos,vel,ts,types
 
-	from ovito.io import import_file # TODO WEIRD BUG, AFTER THIS RUNS, WE CAN'T PLOT STUFF WITH NICEPLOT. WE GET THE FOLLOWING ERROR: ImportError: Cannot load backend 'TkAgg' which requires the 'tk' interactive framework, as 'qt' is currently running
-	# WHY TF DOES OVITO LOAD qt AND HOW DO WE UNLOAD IT??
+	from ovito.io import import_file # TODO WEIRD BUG, AFTER THIS RUNS, WE CAN'T PLOT STUFF WITH NICEPLOT. WE GET THE FOLLOWING ERROR: ImportError: Cannot load backend 'TkAgg' which requires the 'tk' interactive framework, as 'qt' is currently running  WHY TF DOES OVITO LOAD qt AND HOW DO WE UNLOAD IT??
+	# TESTING: 
+	# ase.io.read can also read qdumps, BUT, it takes significantly longer: 
+	# start=time.time() ; loaded=qdump("projects/Si_SED_09b/NVE.qdump"); print(time.time()-start) # takes 6s
+	# start=time.time(); loaded=aseread("NVE.qdump",index=":") ; print(time.time()-start) # takes 39s
 	print("reading qdump")
 	pipeline = import_file(filename)
 	nt=pipeline.source.num_frames
@@ -157,24 +183,36 @@ def qdump(filename,timescaling=1,convert=True): # OBSCENELY FAST IN COMPARISON T
 	na,nxyz=np.shape(data.particles.positions.array)
 	pos=np.zeros((nt,na,3))
 	vel=np.zeros((nt,na,3))
+	types=data.particles.particle_type.array
 	ts=np.arange(nt)*timescaling
 	for n in tqdm(range(nt)):
-		data=pipeline.compute(n)
+		if safemode:
+			try:
+				data=pipeline.compute(n)
+			except:
+				print("safemode == True. failure on timestep",n)
+				continue
+		else:
+			data=pipeline.compute(n)
 		pos[n,:,:]=data.particles.position.array
 		vel[n,:,:]=data.particles.velocities.array
 	if convert:
-		np.save(filename+"_t.npy",ts)
-		np.save(filename+"_p.npy",pos)
-		np.save(filename+"_v.npy",vel)
-	return pos,vel,ts
+		print("ts,pos,vel,typ",ts.shape,pos.shape,vel.shape,types.shape)
+		np.save(filename+"_ts.npy",ts)
+		np.save(filename+"_pos.npy",pos)
+		np.save(filename+"_vel.npy",vel)
+		np.save(filename+"_typ.npy",types)
+	return pos,vel,ts,types
 
+#where=np.where(pos[:,:,2]<.25*c)
+#pos[where,2]+=lz
 
-def avgPos(pos,sx,sy,sz): # takes "pos" as from: pos,timesteps=scrapeDump(trange="-"+str(avgOver)+":"), [nS,nA,xyz]
+def avgPos(pos,sx,sy,sz,alpha=90,beta=90,gamma=90): # takes "pos" as from: pos,timesteps=scrapeDump(trange="-"+str(avgOver)+":"), [nS,nA,xyz]
 	nS,nA,na=np.shape(pos)
 	displacements=np.zeros((nS,nA,na))
 	for t in tqdm(range(nS)):
 		# distance between initial position and position at time t (for each atom, along each axis), including wrapping
-		displacements[t,:,:]=dxyz(pos[0,:,:],pos[t,:,:],sx,sy,sz) 
+		displacements[t,:,:]=dxyz(pos[0,:,:],pos[t,:,:],sx,sy,sz,alpha,beta,gamma) 
 	# average position = initial position + average of all displacements away from initial position
 	# time-dependent displacements *from that average position* also requires subtracting mean(displacements)
 	return pos[0,:,:]+np.mean(displacements[:,:,:],axis=0),displacements-np.mean(displacements[:,:,:],axis=0)
@@ -187,15 +225,24 @@ def getWrapAndRange(size,axis):
 		wrap[axis]=size ; r=[-1,0,1]
 	return wrap,r
 
-def dxyz(pos1,pos2,sx,sy,sz): # given two snapshots of positions [[xa,ya,za],[xb,yb,zb],...] x2, don't just do dxyz=xyz1-xyz2. must include wrapping!
+def dxyz(pos1,pos2,sx,sy,sz,alpha=90,beta=90,gamma=90): # given two snapshots of positions [[xa,ya,za],[xb,yb,zb],...] x2, don't just do dxyz=xyz1-xyz2. must include wrapping!
 	dxyz_0=pos2-pos1
 	# we use these for wrapping
 	wx,i_range=getWrapAndRange(sx,0) ; wy,j_range=getWrapAndRange(sy,1) ; wz,k_range=getWrapAndRange(sz,2)
+	
 	# for pos_1 in the 27 surrounding positions (original, and 26 neighbors), keep only the smallest (absolute) distance found
 	for i in i_range:
 		for j in j_range:
 			for k in k_range:
-				dxyz_w=pos2+i*wx+j*wy+k*wz-pos1 # if an atom crossed the x axis (from +x to -x ie L) it'll register as closer if we take (x0+L)-xf
+
+				# e.g. [.1,.2,-.1] + 1*[25,0,0]+0*[0,10,0]+0*[0,0,10] # to wrap +x for a hypothetical 25x10x10 simulation volume
+				shift_xyz=i*wx+j*wy+k*wz
+				if gamma!=90: # TODO WE SHOULD BE ABLE TO HANDLE NON-90 ALPHA AND BETA TOO
+					skew=np.eye(3) ; skew[0,1]=-np.sin(gamma*np.pi/180-np.pi/2) ; skew[1,1]=np.cos(gamma*np.pi/180-np.pi/2)
+					shift_xyz=np.matmul(skew,shift_xyz)
+				#print(i,j,k,shift_xyz)
+
+				dxyz_w=pos2+shift_xyz-pos1 # if an atom crossed the x axis (from +x to -x ie L) it'll register as closer if we take (x0+L)-xf
 				dxyz_0=absMin(dxyz_0,dxyz_w)
 	return dxyz_0
 
@@ -216,13 +263,15 @@ def absMin(dxyz_a,dxyz_b): # use this for getting absolute distances with wrappi
 # a - this is your specified periodicity (or lattice constant for crystals)
 # nk - resolution in k-space. note your resolution in ω is inherited from ts
 # bs - optional: should be a list of atom indices to include. this allows the caller to sum over crystal cell coordinates (see discussion on Σb below)
+# TODO: currently k_max=π/a. this is convention. so if you want your x axis to be wavelength⁻¹, you need to divide by π? should we do this for you? idk
+# TODO: ditto for ω, which is rad/timestep. you need to scale it accordingly (timesteps to time units) and include 2π to get to Hz vs rad/s
 def SED(avg,velocities,p_xyz,v_xyz,a,nk=100,bs='',perAtom=False,ks='',keepComplex=False):
 	nt,na,nax=np.shape(velocities)
 	if len(bs)==0:
 		bs=np.arange(na)
 	else:
 		na=len(bs)
-	nt2=int(nt/2)
+	nt2=int(nt/2) #; nt2=nt # this is used to trim off negative frequencies
 	if len(ks)==0:
 		ks=np.linspace(0,np.pi/a,nk)
 	else:
@@ -252,7 +301,7 @@ def SED(avg,velocities,p_xyz,v_xyz,a,nk=100,bs='',perAtom=False,ks='',keepComple
 	# and noting the property: e^(A+B)=e^(A)*e^(B)
 	# Φ(k,ω) = | ∫ Σn u°(n,t) exp( i k x̄(n) ) * exp( - i ω t ) dt |²
 	# and noting that the definition of a fourier transform:
-	# F(w) = ∫ f(t) * exp( -i 2 π w t ) dt
+	# F(w) = ∫ f(t) * exp( -i 2 π ω t ) dt
 	# we can reformulate the above eqaution as:
 	# f(t) = u°(n,t) * exp( i k x )
 	# Φ(k,ω) = | FFT{ Σn f(t) } |²
@@ -272,9 +321,10 @@ def SED(avg,velocities,p_xyz,v_xyz,a,nk=100,bs='',perAtom=False,ks='',keepComple
 		xs=np.einsum('ij, ij->i',avg[bs,:],d) # pos • vec, all at once
 		xs/=np.linalg.norm(p_xyz)
 
+	# TODO mongo ram usage for rotation step vs simply using a reference to the existing matrix, if velocities is huge, e.g. simulations with a 100000 atoms, e.g. 50x50x5 UC silicon (8 atoms per UC), as required for 110 SED
 	if isinstance(v_xyz,(int,float)):
 		vs=velocities[:,bs,v_xyz] # t,a,xyz --> t,a
-	else:
+	else: 
 		# for handling velocities, there's just one more step from above: "flattening" first two axes t,a,xyz --> t*a,x,y,z
 		vflat=np.reshape(velocities[:,bs,:],(nt*na,3)) # t,a,xyz --> t*a,xyz
 		v_xyz=np.asarray(v_xyz)
@@ -310,6 +360,38 @@ def SED(avg,velocities,p_xyz,v_xyz,a,nk=100,bs='',perAtom=False,ks='',keepComple
 			Zs[:,j]+=np.absolute(integrated)**2
 	return Zs,ks,ws
 
+# angleRange A : 0 to π, useful for evaluating accoustic vs optical modes (0 vs 180° phase difference between atomic basis atoms)
+# angleRange B : -π/2 to π/2, useful for evaluating orbit-like modes (chiral, AOM, 90° phase difference between two degenerate branches)
+# angleRange C : like B, but vectorized
+def SEDphase(Z1,Z2,angleRange="A"):
+	nw,nk=np.shape(Z1) ; Zs=np.zeros((nw,nk))
+	# ALL AT ONCE IS PROBABLY A BIT FASTER, AND YOU DON'T NEED TO MESS WITH THE DOTS AND CROSSES??? unwrapping/folding is more confusing though
+	if angleRange=="C":									#       π/2
+		t1=np.arctan2(Z1.real,Z1.imag)							#   1    |     2 
+		t2=np.arctan2(Z2.real,Z2.imag)							#     .-'|'-.
+		dt=t1-t2 # may have results outside π/2 < θ < π/2, so we gotta wrap those	# 0__/___|___\___π
+		dt[dt>np.pi]-=2*np.pi	# step 1 is to unwrap, but keep quadrant: 3π/2=-π/2	# 2π \   |   /
+		dt[dt<-np.pi]+=2*np.pi								#     `-.|.-'
+		# step 2 is to reflect Q2 and Q3 back to Q1 and Q4				#  4     |     3
+		Q2=np.zeros(dt.shape) ; Q2[dt>np.pi/2]=1 ; dt[Q2==1]*=-1 ; dt[Q2==1]+=np.pi	#       3π/2
+		Q3=np.zeros(dt.shape) ; Q3[dt<-np.pi/2]=1 ; dt[Q3==1]*=-1 ; dt[Q3==1]-=np.pi
+		return dt
+
+	for i in tqdm(range(nw)):
+		for j in range(nk):
+			v1=np.asarray( [ Z1[i,j].real , Z1[i,j].imag ] ) # Re/Im parts are vectors. we want the angle between them
+			v2=np.asarray( [ Z2[i,j].real , Z2[i,j].imag ] )
+			m1=np.sqrt(np.sum(v1**2)) ; m2=np.sqrt(np.sum(v2**2))
+			if angleRange=="A":		# yields angles 0 to π
+				Z=np.dot(v1,v2)/m1/m2	# dot product: 1 if vectors are parallel, zero if vectors are perpendicular. 
+				angle=np.arccos(Z)	# angle between vectors (if using dot). θ=cos⁻¹( (a•b)/|a||b| )
+			elif angleRange=="B": 		# yields angles -π/2 to π/2
+				Z=np.cross(v1,v2)	# cross-product: ±1 is vectors are perpendicular, sign denotes lagging or leading. 
+				Z*=1/m1/m2		# note: cross product scales with magnitude of vectors (as did dot product above)
+				angle=np.arcsin(Z)	# θ=sin⁻¹(...), cos⁻¹ is signless
+			Zs[i,j]=angle
+	return Zs
+
 def addDumpColumn(dumpfile,columnvals,outfile):
 	f1=open(dumpfile,'r')
 	f2=open(outfile,'w')
@@ -330,6 +412,22 @@ def addDumpColumn(dumpfile,columnvals,outfile):
 				vals='\t'.join([ str(v) for v in vals ])
 			line=line+'\t'+str(vals)+'\n'
 		f2.write(line)
+
+# save positions (na,xyz) to a positions file. useful for visualizing avg and stuff
+def outToPositionsFile(filename,pos,types,sx,sy,sz,masses):
+	import datetime
+	now=datetime.datetime.now()
+	lines=["########### lammpsScapers.py > outToPositionsFile() "+now.strftime("%Y/%m/%d %H:%M:%S")+" ###########"]
+	lines=lines+[str(len(pos))+" atoms","",str(len(masses))+" atom types",""]
+	for s,xyz in zip([sx,sy,sz],["x","y","z"]):
+		lines.append("0.0 "+str(s)+" "+xyz+"lo "+xyz+"hi")
+	lines=lines+["","Masses",""]+[ str(i+1)+" "+str(m) for i,m in enumerate(masses) ]+["","Atoms",""]
+	for t,xyz in zip(types,pos):
+		t=int(t) ; atxyz=[ str(v) for v in [1,t,*xyz] ]
+		lines.append(" ".join(atxyz))
+	with open(filename,'w') as f:
+		for l in lines:
+			f.write(l+"\n")
 
 # pos should be average atomic positions. you'll need to call avgPos yourself
 # neighborLocations should be coordinates where you expect to find neighbors
@@ -354,8 +452,8 @@ def procrustes(positions,sx,sy,sz,neighborLocations,rotation=True,scaling="aniso
 		for i,perm in enumerate(permutations):
 			#for each rotation, iso scale, anisoscale, the 3 steps are: "compute it" "apply it" "log it"
 			#ROTATION: https://en.wikipedia.org/wiki/Kabsch_algorithm and https://github.com/charnley/rmsd/blob/master/rmsd/calculate_rmsd.py
-			P=neighlocs[perm,:] 
-			Q=neighborLocations ; R=np.identity(3) #"attempting rotation of P onto Q"
+			P=neighlocs[perm,:]
+			Q=neighborLocations ; R=np.identity(3) # "attempting rotation of P onto Q"
 			H=np.dot(np.transpose(P),Q) #"covariance matrix"
 			U,S,V=np.linalg.svd(H)
 			if (np.linalg.det(U) * np.linalg.det(V)) < 0.0:
@@ -384,16 +482,413 @@ def procrustes(positions,sx,sy,sz,neighborLocations,rotation=True,scaling="aniso
 		sczs[a]=scz[p]
 		scis[a]=sci[p]
 	return pcds,rots,scxs,scys,sczs,scis
-
+ 
 def binning(array,n,axis=0):
-	shape=np.asarray(np.shape(array),dtype=int) ; shape[axis]/=n
-	new=np.zeros(shape)
-	for i in range(n):
+	shape=np.asarray(np.shape(array),dtype=int) ; shape[axis]//=n	# scale appropriate axis (e.g. down by 10
+	new=np.zeros(shape)						# create empty new binned array
+	print(shape)
+	for i in range(n):	# "starting at 0, every 10th. then starting at 1, every 10th" and so on. trailing values ignored
 		if axis==0:
-			new+=array[i::n]
+			new+=array[i:i+n*new.shape[0]:n]
 		else:
 			new+=array[:,i::n]
 	new/=n
 	return new
+
+# returns a function which can be passed a triplet of three atoms' positions, [ijk,xyz], and return the potential energy
+def potentialFunc_SW(swfile):
+	r_cut,potential2Body,potential3Body=SW(swfile)
+	print("r_cut",r_cut)
+	def potential(pos):
+		vij=pos[1,:]-pos[0,:]
+		vik=pos[2,:]-pos[0,:]
+		rij=lVec(vij) ; rik=lVec(vik)
+		if rij>r_cut or rik>r_cut:
+			return 0
+		tijk=angBetween(vij,vik)
+		return potential3Body(rij,rik,tijk)+potential2Body(rij)
+	return potential
+
+#E=ΣᵢΣⱼϕ₂(rᵢⱼ)+ΣᵢΣⱼΣₖϕ₃(rᵢⱼ,rᵢₖ,θᵢⱼₖ)
+#ϕ₂ is 2-body component, ϕ₂(rᵢⱼ)=A ϵ *[ B*(σ/r)^p-(σ/r)^q ] * exp( σ / r-a*σ )
+#ϕ₃ is 3-body component, ϕ₃(rᵢⱼ,rᵢₖ,θᵢⱼₖ)=λ ϵ (cos(θᵢⱼₖ)-cos₀)² exp( γᵢⱼσᵢⱼ / r-aᵢⱼ*σᵢⱼ ) exp( γᵢₖσᵢₖ / r-aᵢₖ*σᵢₖ )
+#calculate potential energy E for each atom in A as a result of its interaction with each atom in B.
+def SW(swfile):
+	sw=readSW(swfile)
+	e=sw["e"];s=sw["s"];a=sw["a"];l=sw["l"];g=sw["g"];c=sw["c"];A=sw["A"];B=sw["B"];p=sw["p"];q=sw["q"];t=sw["t"]
+	r_cut=a*s*.99 #BEWARE: check this if you change sw potentials! use sw2LJ()
+	def potential2Body(rij):
+		return A*e*(B*(s/rij)**p-(s/rij)**q)*np.exp(s/(rij-a*s))
+	def potential3Body(rij,rik,tijk):
+		return l*e*(np.cos(tijk)-c)**2*np.exp(g*s/(rij-a*s))*np.exp(g*s/(rik-a*s))
+	return r_cut,potential2Body,potential3Body
+
+def readSW(swfile):
+	f=open(swfile,'r',errors='ignore') #some versions of python choke on readlines() if there are unicode characters in the file being read (eg, umlauts because some germans developed your SW potential)
+	entries={}
+	lines=f.readlines()
+	for l in lines:
+		if len(l)<1 or l[0]=="#" or len(l.split())<14:
+			continue
+		#print(l)			#                  0       1     2 3      4     5         6 7 8 9 10
+		l=list(map(float,l.split()[3:]))	#elem1,elem2,elem3,epsilon,sigma,a,lambda,gamma,costheta0,A,B,p,q,tol
+		names="e,s,a,l,g,c,A,B,p,q,t"
+		for n,v in zip(names.split(','),l):
+			entries[n]=float(v)
+		return entries	
+
+def lVec(v1):
+	return np.sqrt( np.sum( v1**2 ) )
+def angBetween(v1,v2): # cos(θ)=(vᵢⱼ•vᵢₖ)/(|vᵢⱼ|*|vᵢₖ|)
+	return np.arccos(np.dot(v1,v2)/(lVec(v1)*lVec(v2))) #cos(θ)=(vᵢⱼ•vᵢₖ)/(|vᵢⱼ|*|vᵢₖ|)
+
+#combining calculated Fx(t), Fy(t), Fz(t) with exported Vx(t), Vy(t), Vz(t): Q_LA(ω)=ΣᵢFxᵢ(ω)*Vxᵢ(ω), Q_TA(ω)=ΣᵢFyᵢ(ω)*Vyᵢ(ω), Q_TA(ω)=ΣᵢFzᵢ(ω)*Vzᵢ(
+# Qᴬᴮ(t)=ΣᵢΣⱼ⟨ dUᵢ/drᵢⱼ * vᵢ - dUⱼ/dⱼᵢ * vⱼ ⟩ PRB95,144309 eq 27, Q(ω)=FFT(Q(t)) (post-summing), Work = Force * Velocity, "work on A by B, minus work on B by A", note cross-correlation ⟨-⟩, since FFT(f(t))*FFT(g(t))≠FFT(f(t)*g(t)), but rather, FFT(⟨f(t),g(t)⟩)
+# need pairwise forces: Force=dEnergy/dx (change in energy as you move an atom, so compute E, perturb atom 'm' by dx, recompute E, Fₘ=(Eoₘ-Eₘ)/dx for force on 'm'
+# two body term: force between 'm' and 'p' are pairwise, ie, Fₘₚ₂=-Fₚₘ₂, "force on m applied by p" vs "force on p applied by m"
+# three body term: we can compute "force on m", "force on p", "force on u", but the potential does not prescribe which forces came from where. "how much of the 
+#    force on p came from m vs came from u?", we aren't told. but, this means we are allowed to choose. so we can just say that the central atom acts on both 
+#    outer atoms, and there is no interaction between the two outer atoms. This means "force on m" is "force on m applied by p" and "force on u" is "force on u 
+#    applied by p". This then allows a return to pairwise "equal and opposite" interactions, ie, Fₘₚ₃=-Fₚₘ₃, Fᵤₚ₃=-Fₚᵤ₃
+# finally, given that the potential is additive (sum these terms across all sets of atoms), so is heat flux. for each set of atoms, we can simply add up each 
+#    Qₘₚ=Fₘₚ*Vₘ-Fₚₘ*Vₚ
+#Fx=dE/dx, Fy=dE/dy, Fz=dE/dz
+
+
+
+	# need pairwise forces: Force=dEnergy/dx (change in energy as you move an atom, so compute E, perturb atom 'm' by dx, recompute E, Fₘ=(Eoₘ-Eₘ)/dx for force on 'm'
+	# two body term: force between 'm' and 'p' are pairwise, ie, Fₘₚ₂=-Fₚₘ₂, "force on m applied by p" vs "force on p applied by m"
+
+
+# Power = Force * velocity , Fₓ=dU/dx. for two atoms interacting: Qᵢⱼ=dUᵢ/drᵢⱼ *  vᵢ - dUⱼ/dⱼᵢ * vⱼ , "net work: power on i by j minus power on j by i"
+# In the time domain: Qᴬᴮ(t)=ΣᵢΣⱼ( dUᵢ(t)/drᵢⱼ * vᵢ(t) - dUⱼ(t)/dⱼᵢ * vⱼ(t) )
+# In the frequency domain: Qᴬᴮ(ω)=ΣᵢΣⱼ( dUᵢ(ω)/drᵢⱼ * vᵢ(ω) - dUⱼ(ω)/dⱼᵢ * vⱼ(ω) )
+# Note that these are NOT the same! ℱ[ f(t) * g(t) ] ≠ ℱ[ f(t) ] * ℱ[ g(t) ] (or f(ω)*g(ω))
+# another way to think about this is: our fundamental question is "what (frequency of) oscillatory forces result in energy flow", which is a slightly separate question from simply "what oscillatory forces are there" (or oscillatory velocities, as in vDOS). Imagine the simplest case where F=-sin(ωt) and v=cos(ωt). The force "leads" the velocity slightly, and this is a case where the there is there clearly ought to be a net Q at ω. mathematically though, Q(t)=sin(ωt)*cos(ωt) which is a function with *half* the periodicity (function is positive when F and v are both positive, or when F and v are both negative). clearly we want F(ω) and v(ω) separate, i.e. ℱ[ F(t) ] * ℱ[ v(t) ]
+# So if ℱ[ f(t) * g(t) ] ≠ ℱ[ f(t) ] * ℱ[ g(t) ], then what IS ℱ[ f(t) ] * ℱ[ g(t) ] in the time domain?
+# ℱ[ f(t) ] * ℱ[ g(t) ] = ℱ[ ⟨ f(t),g(t) ⟩ ] (where ⟨-⟩ that's a cross-correlation) 
+# So Q(ω) is NOT simply ℱ[ Q(t) ], but either ℱ[ F(t) ] * ℱ[ v(t) ] or ℱ[ ⟨ F(t),v(t) ⟩ ]
+# And expanding this to "power between sides A and B", we sum over atoms in A and B, only including instances where i is in A and j is in B
+# And practically in the code, how do we get forces? and what about the case of a 3-body potential?
+# Consider atoms j-i-k where i is the central atom. 
+# Let's start with "forces on j" (Fⱼ). compute energy (Eₒ), perturn atom j by dx and recalculate (Eₚⱼ). Fⱼₓ=-(Eₚⱼ-Eₒ)/dx (if Eₚⱼ > Eₒ, force is in negative direction). If we perturbed j, this is net force on j (Fⱼ)
+# For a many-body potential, we will make the assumption that satellite atoms only experience a force from the central atom: Fⱼₖ=0, thus Fⱼᵢ=Fⱼ ("force on j by i is the same as the net force on j"). repeat for Fₖᵢ=Fₖ=(Eₚₖ-Eₒ)/dx. For forces on i, we can say interactions are "equal and opposite", Fᵢⱼ=-Fⱼᵢ, Fᵢ=-Fₖᵢ, and then for net force on i, we can sum: Fᵢ=Fᵢⱼ+Fᵢₖ
+# Is this assumption of Fⱼₖ=Fₖⱼ=0 allowed?? the potential does not define forces, it defines energy. so we can make whatever statements we want so long as the energy expressions are satisfied! 
+# How does this code work? pass average positions, displacements, velocities, where you want to slice, and your stillinger weber file. 
+# we'll iterate through all triplets of atoms j-i-k (treating i as the central atom). skip triplets with atoms too far apart. we'll perturb atom j and k so we can separate Fji, Fki, Fij, Fik. repeat for each timestep. and write these off to a file. (no need to recalculate forces on subsequent runs!). with forces known, we run the FFT(correlate(F,v)) stuff above, taking note that, for example, Fj only contributes if atoms i,j are on opposite sides and so on.
+def SHF_SW(avg,disp,velocities,sliceX,swfile):
+	# why take avg+disp? this will include wrapping (ensuring an atom is always on the same side of the simulation)
+	positions=avg+disp
+	# read SW potential. create potentialNBody functions which we pass interatomic radii / bond angles into
+	r_cut,potential2Body,potential3Body=SW(swfile) ; print("r_cut",r_cut)
+	# pre-trim to only keep atoms two r_cuts away from the interface! 
+	xmask=np.zeros(len(avg))+1 ; xmask[avg[:,0]<sliceX-2*r_cut]=0 ; xmask[avg[:,0]>sliceX+2*r_cut]=0
+	avg=avg[xmask==1,:] ; positions=positions[:,xmask==1,:] ; velocities=velocities[:,xmask==1,:]
+	na=len(avg) ; nt=len(positions)
+
+	# displacements we're going to apply to atoms (no displacements, dx,dy,dz)
+	dxyzs=np.asarray([ [0,0,0],[.0001,0,0],[0,.0001,0],[0,0,.0001] ])
+
+	# calculate distances between pairs of atoms (allows quick and easy filtering, e.g. skipping triplets of atoms all on the same side)
+	print("calculating dBetween")
+	#dBetween=positions[:,:,None,:]-positions[:,None,:,:]	# t,i,j,xyz will tell us distance (at each time) between atoms i and j
+	#dBetween=np.sum( dBetween**2, axis=3 )			# dx,dy,dz --> distance between
+	#dBetween=np.amin( dBetween, axis=0)			# minimum distance through course of simulation
+	dBetween=np.zeros((na,na))
+	for i in tqdm(range(na)):				# loop instead (positions might be huge and we'll blow up RAM if we do above)
+		for j in range(na):
+			if i==j:
+				dBetween[i,j]=np.inf ; continue	# don't let self-self distance be set to zero...
+			v=positions[:,j,:]-positions[:,i,:] 	# t,a,xyz --> t,xyz (3D vector for each timestep)
+			d=np.sqrt( np.sum( v**2, axis=1) )	# length of said 3D vector
+			dBetween[i,j]=np.amax(d)		# furthest distance two atoms are ever apart (e.g. exclude atoms that sometimes just stray outside the cutoff distance)
+
+	print("calculate forces (or check saved forces files)")
+	for i in tqdm(range(na)):
+		xi=avg[i,0]
+		for j in range(na):
+			if j==i:
+				continue
+			if dBetween[i,j]>r_cut-.001:
+				continue
+			xj=avg[j,0]
+			for k in range(na):
+				if k==j or k==i:
+					continue
+				if dBetween[i,k]>r_cut-.001:
+					continue
+				xk=avg[k,0]
+				if xi < sliceX and xj < sliceX and xk < sliceX:
+					continue
+				if xi > sliceX and xj > sliceX and xk > sliceX:
+					continue
+
+				logfile="SHF/Fi_"+str(i)+"-"+str(j)+"-"+str(k)+".txt"
+				if os.path.exists(logfile):
+					Fi_xyz=list( np.loadtxt(logfile) ) # column for Fx,Fy,Fz --> nt,3
+				else:
+					Fi_xyz=[]
+				logfile="SHF/Fj_"+str(i)+"-"+str(j)+"-"+str(k)+".txt"
+				if os.path.exists(logfile):
+					Fj_xyz=list( np.loadtxt(logfile) )
+				else:
+					Fj_xyz=[]
+				logfile="SHF/Fk_"+str(i)+"-"+str(j)+"-"+str(k)+".txt"
+				if os.path.exists(logfile):
+					Fk_xyz=list( np.loadtxt(logfile) ) # column for Fx,Fy,Fz --> nt,3
+				else:
+					Fk_xyz=[]
+
+				for t in range(len(Fi_xyz),nt):
+					vik=positions[t,k,:]-positions[t,i,:]
+					#if lVec(vik)>r_cut-.001:
+					#	continue
+					Ej=np.zeros(4) # used for force on atom i (perturning position of atom i)
+					for n,dxyz in enumerate(dxyzs):
+						vij=(positions[t,j,:]+dxyz)-positions[t,i,:]		# vector "from i, to j"
+						vik=positions[t,k,:]-positions[t,i,:]
+						rij=lVec(vij) ; rik=lVec(vik) ; tijk=angBetween(vij,vik)
+						Ej[n] = potential3Body(rij,rik,tijk)+potential2Body(rij)
+						#print("vij",vij,"vik",vik,"rij",rij,"rik",rik,"tijk",tijk,"Ei["+str(n)+"]",Ei[n])
+					Fji=-(Ej[1:]-Ej[0])/.0001 # force on i (assume force from j is zero)
+					#print("Fi",Fi)
+					#time.sleep(1)
+					Ek=np.zeros(4) # used for force on atom k (perturbing position of atom k)
+					for n,dxyz in enumerate(dxyzs):
+						vij=positions[t,j,:]-positions[t,i,:]
+						vik=(positions[t,k,:]+dxyz)-positions[t,i,:]
+						rij=lVec(vij) ; rik=lVec(vik) ; tijk=angBetween(vij,vik)
+						Ek[n] = potential3Body(rij,rik,tijk)+potential2Body(rij)
+					Fki=-(Ek[1:]-Ek[0])/.0001 # force on k (assume force from j is zero)
+					Fik=-1*Fki				# F on i by k is equal-and-opposite F on k by i
+					Fij=-1*Fji
+					Fi=Fij+Fik 				# Fi=Fij+Fik. F on i, from j, is total F on i (Fi) minus force on i by k
+					# atom i always contributes to energy exchange, since it's central
+					#if xi>sliceX:			# atom i to the right of the interface, net Q is in + direction across
+					#	Q+=Fi*velocities[t,i,:] # Fx,Fy,Fz times Vx,Vy,Vz
+					#else:				# or vice versa, can have net Q in - direction across
+					#	Q-=Fi*velocities[t,i,:]
+					# atom j only contributes if i,j on opposing sides of the interface
+					#if ( xi<sliceX and xj>sliceX ):	# j is right of the interface, receiving heat
+					#	Q+=Fji*velocities[t,j,:]
+					#if ( xi>sliceX and xj<sliceX ): # j is on left. any energy j "gains" is a "negative flow" across the interface
+					#	Q-=Fji*velocities[t,j,:]
+					# atom k only contributes if i,k on opposing sides of the interface
+					#if ( xi<sliceX and xk>sliceX ): 
+					#	Q+=Fji*velocities[t,j,:]
+					#if ( xi>sliceX and xk<sliceX ): 
+					#	Q-=Fji*velocities[t,j,:]
+					Fi_xyz.append(Fi) ; Fj_xyz.append(Fji) ; Fk_xyz.append(Fki)
+
+				np.savetxt("SHF/Fi_"+str(i)+"-"+str(j)+"-"+str(k)+".txt",Fi_xyz)
+				np.savetxt("SHF/Fj_"+str(i)+"-"+str(j)+"-"+str(k)+".txt",Fj_xyz)
+				np.savetxt("SHF/Fk_"+str(i)+"-"+str(j)+"-"+str(k)+".txt",Fk_xyz)
+
+				if os.path.exists("killSHF"):
+					sys.exit()
+	
+	#	Qt.append(Q)
+	#return Qt
+
+	print("calculate Q from F and v")
+	Qt=np.zeros((nt,3)) ; Qw=np.zeros((nt,3),dtype=complex)
+	for i in tqdm(range(na)):
+		xi=avg[i,0]
+		for j in range(na):
+			if j==i:
+				continue
+			if dBetween[i,j]>r_cut-.001:
+				continue
+			xj=avg[j,0]
+			for k in range(na):
+				if k==j or k==i:
+					continue
+				if dBetween[i,k]>r_cut-.001:
+					continue
+				xk=avg[k,0]
+				logfile="SHF/Fi_"+str(i)+"-"+str(j)+"-"+str(k)+".txt"
+				if not os.path.exists(logfile):
+					continue
+				logfile="SHF/Fi_"+str(i)+"-"+str(j)+"-"+str(k)+".txt"
+				Fi_xyz=np.loadtxt(logfile)
+				logfile="SHF/Fj_"+str(i)+"-"+str(j)+"-"+str(k)+".txt"
+				Fj_xyz=np.loadtxt(logfile)
+				logfile="SHF/Fk_"+str(i)+"-"+str(j)+"-"+str(k)+".txt"
+				Fk_xyz=np.loadtxt(logfile)
+
+				# "LLR" for j--i-|-k for example
+				LR={True:"L",False:"R"}[xi<sliceX] + {True:"L",False:"R"}[xj<sliceX] + {True:"L",False:"R"}[xk<sliceX]
+				for xyz in [0,1,2]:
+					if LR=="LRR": # both j,k on opposite side
+						Qt[:,xyz]-=np.correlate(Fi_xyz[:,xyz],velocities[:,i,xyz],mode="same")	# i on left gaining energy is net
+						Qt[:,xyz]+=np.correlate(Fk_xyz[:,xyz],velocities[:,k,xyz],mode="same")	# "left" flow, convention negative
+					if LR=="RLL": # same as above but flip signs
+						Qt[:,xyz]+=np.correlate(Fi_xyz[:,xyz],velocities[:,i,xyz],mode="same")
+						Qt[:,xyz]-=np.correlate(Fk_xyz[:,xyz],velocities[:,k,xyz],mode="same")
+					if LR=="LLR": # j is on the same side as i, so subtract the "force on i by j" Fij
+						Fi=Fi_xyz[:,xyz]+Fj_xyz[:,xyz] # Fij=-Fji, Fik=Fi-Fij
+						Qt[:,xyz]-=np.correlate(Fi,velocities[:,i,xyz],mode="same")
+						Qt[:,xyz]+=np.correlate(Fk_xyz[:,xyz],velocities[:,k,xyz],mode="same")
+					if LR=="RRL":
+						Fi=Fi_xyz[:,xyz]+Fj_xyz[:,xyz]
+						Qt[:,xyz]+=np.correlate(Fi,velocities[:,i,xyz],mode="same")
+						Qt[:,xyz]-=np.correlate(Fk_xyz[:,xyz],velocities[:,k,xyz],mode="same")
+					if LR=="LRL": # now k is on the same side as i. like LLR but swap j,k
+						Fi=Fi_xyz[:,xyz]+Fk_xyz[:,xyz] # Fik=-Fki, Fij=Fi-Fik
+						Qt[:,xyz]-=np.correlate(Fi,velocities[:,i,xyz],mode="same")
+						Qt[:,xyz]+=np.correlate(Fj_xyz[:,xyz],velocities[:,k,xyz],mode="same")
+					if LR=="RLR":
+						Fi=Fi_xyz[:,xyz]+Fk_xyz[:,xyz]
+						Qt[:,xyz]+=np.correlate(Fi,velocities[:,i,xyz],mode="same")
+						Qt[:,xyz]-=np.correlate(Fj_xyz[:,xyz],velocities[:,k,xyz],mode="same")
+
+
+
+				#for xyz in [0,1,2]:
+				#	# TODO THIS ISN'T QUITE RIGHT. WE ONLY CARE ABOUT F ACROSS THE INTERFACE. Fi MIGHT HAVE SOME FORCE FROM j ON THE SAME SIDE FOR EXAMPLE		#
+				#	# atom i always contributes to energy exchange, since it's central
+				#	if xi>sliceX:			# atom i to the right of the interface, net Q is in + direction across
+				#		Qt[:,xyz]+=np.correlate(Fi_xyz[:,xyz],velocities[:,i,xyz],mode="same") # Fx,Fy,Fz times Vx,Vy,Vz
+				#	else:				# or vice versa, can have net Q in - direction across
+				#		Qt[:,xyz]-=np.correlate(Fi_xyz[:,xyz],velocities[:,i,xyz],mode="same")
+				#	# atom j only contributes if i,j on opposing sides of the interface
+				#	if ( xi<sliceX and xj>sliceX ):	# j is right of the interface, receiving heat
+				#		Qt[:,xyz]+=np.correlate(Fj_xyz[:,xyz],velocities[:,j,xyz],mode="same")
+				#	if ( xi>sliceX and xj<sliceX ): # j is on left. any energy j "gains" is a "negative flow" across the interface
+				#		Qt[:,xyz]-=np.correlate(Fj_xyz[:,xyz],velocities[:,j,xyz],mode="same")
+				#	# atom k only contributes if i,k on opposing sides of the interface
+				#	if ( xi<sliceX and xk>sliceX ): 
+				#		Qt[:,xyz]+=np.correlate(Fk_xyz[:,xyz],velocities[:,k,xyz],mode="same")
+				#	if ( xi>sliceX and xk<sliceX ): 
+				#		Qt[:,xyz]-=np.correlate(Fk_xyz[:,xyz],velocities[:,k,xyz],mode="same")
+				
+				#if xi>sliceX:			# atom i to the right of the interface, net Q is in + direction across
+				#	Qt[:,:]+=Fi_xyz[:,:]*velocities[:,i,:] # Fx,Fy,Fz times Vx,Vy,Vz
+				#else:				# or vice versa, can have net Q in - direction across
+				#	Qt[:,:]-=Fi_xyz[:,:]*velocities[:,i,:]
+				# atom j only contributes if i,j on opposing sides of the interface
+				#if ( xi<sliceX and xj>sliceX ):	# j is right of the interface, receiving heat
+				#	Qt[:,:]+=Fj_xyz[:,:]*velocities[:,j,:]
+				#if ( xi>sliceX and xj<sliceX ): # j is on left. any energy j "gains" is a "negative flow" across the interface
+				#	Qt[:,:]-=Fj_xyz[:,:]*velocities[:,j,:]
+				# atom k only contributes if i,k on opposing sides of the interface
+				#if ( xi<sliceX and xk>sliceX ): 
+				#	Qt[:,:]+=Fk_xyz[:,:]*velocities[:,k,:]
+				#if ( xi>sliceX and xk<sliceX ): 
+				#	Qt[:,:]-=Fk_xyz[:,:]*velocities[:,k,:]
+
+				#for xyz in [0,1,2]:
+				#	# atom i always contributes to energy exchange, since it's central
+				#	Qi=Fi_xyz[:,xyz]*velocities[:,i,xyz]
+				#	Qj=Fj_xyz[:,xyz]*velocities[:,j,xyz]
+				#	Qk=Fk_xyz[:,xyz]*velocities[:,k,xyz]
+				#	if xi>sliceX:			# atom i to the right of the interface, net Q is in + direction across
+				#		Qt[:,xyz]+=np.correlate(Qi,Qi,mode="same") # Fx,Fy,Fz times Vx,Vy,Vz
+				#	else:				# or vice versa, can have net Q in - direction across
+				#		Qt[:,xyz]-=np.correlate(Qi,Qi,mode="same")
+				#	# atom j only contributes if i,j on opposing sides of the interface
+				#	if ( xi<sliceX and xj>sliceX ):	# j is right of the interface, receiving heat
+				#		Qt[:,xyz]+=np.correlate(Qj,Qj,mode="same")
+				#	if ( xi>sliceX and xj<sliceX ): # j is on left. any energy j "gains" is a "negative flow" across the interface
+				#		Qt[:,xyz]-=np.correlate(Qj,Qj,mode="same")
+				#	# atom k only contributes if i,k on opposing sides of the interface
+				#	if ( xi<sliceX and xk>sliceX ): 
+				#		Qt[:,xyz]+=np.correlate(Qk,Qk,mode="same")
+				#	if ( xi>sliceX and xk<sliceX ): 
+				#		Qt[:,xyz]-=np.correlate(Qk,Qk,mode="same")
+
+				#if xi>sliceX:			# atom i to the right of the interface, net Q is in + direction across
+				#	Qw[:,:]+=np.fft.fft(Fi_xyz[:,:]*velocities[:,i,:],axis=0) # Fx,Fy,Fz times Vx,Vy,Vz
+				#else:				# or vice versa, can have net Q in - direction across
+				#	Qw[:,:]+=np.fft.fft(Fi_xyz[:,:]*velocities[:,i,:],axis=0)
+				# atom j only contributes if i,j on opposing sides of the interface
+				#if ( xi<sliceX and xj>sliceX ):	# j is right of the interface, receiving heat
+				#	Qt[:,:]+=Fj_xyz[:,:]*velocities[:,j,:]
+				#if ( xi>sliceX and xj<sliceX ): # j is on left. any energy j "gains" is a "negative flow" across the interface
+				#	Qt[:,:]-=Fj_xyz[:,:]*velocities[:,j,:]
+				# atom k only contributes if i,k on opposing sides of the interface
+				#if ( xi<sliceX and xk>sliceX ): 
+				#	Qt[:,:]+=Fk_xyz[:,:]*velocities[:,k,:]
+				#if ( xi>sliceX and xk<sliceX ): 
+				#	Qt[:,:]-=Fk_xyz[:,:]*velocities[:,k,:]
+
+	return np.fft.fft(Qt,axis=0)
+	#return Qw
+
+# For each atom i, find atoms j,k,l,m,n,o within the radii limits
+# avgs - [na,xyz]
+def findNeighbors(avgs,r_min=0,r_max=np.inf):
+	neighbors=[]
+	na=len(avgs) ; indices=np.arange(na)
+	print("calculating neighbor distances")
+	d0=np.sqrt( np.sum( (avgs[:,None,:]-avgs[None,:,:])**2 , axis=2) ) # √(dx²+dy²+dz²), yields an na x na "lookup" matrix of distances
+	print("iterating")
+	for i in range(na):
+		mask=np.zeros(na)+1 ; mask[d0[i,:]<r_min]=0 ; mask[d0[i,:]>r_max]=0 ; mask[i]=0
+		neighbors.append([i]+list(indices[mask==1])) # ensure atom i is first in the list!
+	return neighbors
+
+# only keep neighbors when at least one is in both groups
+# neighbors - a potentially-ragged list of lists, each list containing atom IDs
+# As, Bs - lists of atom IDs
+def filterNeighborsByGroup(neighbors,As,Bs):
+	filtered=[]
+	for ijk in neighbors:
+		inA=[ i for i in ijk if i in As ]
+		inB=[ i for i in ijk if i in Bs ]
+		if len(inA)>0 and len(inB)>0:
+			filtered.append(ijk)
+	return filtered
+
+# positions - [nt,na,xyz]
+# potential - a function which can be passed a list of atom's positions [na,xyz] and return the potential energy
+# atomSets - lists of atomIDs to feed into potential. e.g. i,j,k triplets for a 3-body potential
+def calculateInteratomicForces(positions,potential,atomSets,perturbBy=.0001):
+	os.makedirs("calculateInteratomicForces",exist_ok=True)
+	nt=len(positions)
+	nBody=len(atomSets[0])
+	#dxyz=np.zeros((nBody,nBody)) ; dxyz.flat[::nBody+1]=perturbBy
+	for ijk in tqdm(atomSets):
+		for xyz in range(3):
+			forces=np.zeros((nt,nBody)) # will hold force at each timestep: total on i, then contribution from j,k,etc
+			for t in range(nt):
+				atoms=positions[t,ijk,:]
+				Vo=potential(atoms)					# potential energy for unperturbed atomic configuration
+				for j in range(nBody):					# for each atom in the set
+					dx=np.zeros((nBody,3)) ; dx[j,xyz]=perturbBy	# perturbation matrix: perturb the jth atom, in x or y or z
+					#print("xyz",xyz,"j",j,"dx",dx)
+					Vi=potential(atoms+dx)				# recalculate potential, perturbing atom j in x y or z
+					forces[t,j]=-(Vi-Vo)/perturbBy			# Fx=-dE/dx. if Vp > Vo, Force is negative!
+			xyzString=["x","y","z"][xyz]
+			ijkString=",".join([ str(j) for j in ijk ])
+			fileout="calculateInteratomicForces/F"+xyzString+"_"+ijkString+".txt"
+			np.savetxt(fileout,forces)
+
+def SHF(velocities,As,Bs):
+	forceFiles=glob.glob("calculateInteratomicForces/*")
+	nt=len(velocities)
+	Qt=np.zeros((nt,3))
+	for f in tqdm(forceFiles):
+		xyz=["Fx","Fy","Fz"].index(f.split("/")[-1].split("_")[0])
+		ijk=f.split("/")[-1].split("_")[-1].replace(".txt","").split(",")
+		ijk=[ int(i) for i in ijk ]
+		inA=[ i for i in ijk if i in As ]
+		inB=[ i for i in ijk if i in Bs ]
+		forces=np.loadtxt(f)		# columns are: Fi, Fj, Fk. these came from perturbing atoms i,j,k and so on.
+		# if atom i on the left, j,k,etc gaining energy is +Q and i gaining energy is -Q. flipped if i on right
+		i=ijk[0]
+		sign={True:1,False:-1}[ i in As ]
+		# we're going to sum up forces acting on by only atoms on the other side of the boundary
+		Fi=np.zeros(nt)
+		for c,j in enumerate(ijk):
+			if c==0:
+				continue
+			if ( i in As and j in Bs ) or ( i in Bs and j in As ): # i on left, j on right, or vice-versa. IF SO, Fj*v*j counts towards Q
+				# Fj was found by perturbing j, so this is F on j by i. 
+				Qt[:,xyz]+=sign*np.correlate(forces[:,c],velocities[:,j,xyz],mode="same")
+				Fi-=forces[:,c] # F on i by j is equal-and-opposite
+				#print(types[i],types[j])
+		Qt[:,xyz]-=sign*np.correlate(Fi,velocities[:,i,xyz],mode="same")
+	return np.fft.fft(Qt,axis=0)
 
 

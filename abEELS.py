@@ -69,10 +69,11 @@ def main_PZ():
 def main_JACR(): 
 	importPositions()	# reads in globals: velocities,ts,types,avg,disp
 	preprocessPositions()	# handles trimming/rotation, but NOT tiling
+
 	aseString=[ atomTypes[t-1]+"1" for t in types ]
 	aseString="".join(aseString) ; lx,ly,lz=a*nx,b*ny,c*nz
  
-	t0=0 
+	global t0
 	#t0=np.random.randint(len(ts)-maxTimestep) # TODO WHAT IS THE PROPER WAY TO STACK? for PZ method we select random (frequency-binned) timesteps for stacking in z. and tiling in x,y. here though, the temporal continuity maybe matters? 
 	if restartFrom:
 		offsets=np.linspace(0,len(ts)-maxTimestep,numCycles+2,endpoint=False,dtype=int)
@@ -82,12 +83,22 @@ def main_JACR():
 		
 	# run ewave concurrently for chunks of timesteps
 	for t in np.arange(len(ts))[::concurrentTimesteps]:
+		# don't bother constructing the atoms objects if we're just going to skip it inside ewave! moved lookForFile code to its own function to call here
+		if os.path.exists(psiFileName("t"+str(t))): 
+			print("skipping timestep",t)
+			continue
 		if t>=maxTimestep:
 			break
+
 		atomStack=[]
 		for i in range(concurrentTimesteps):
 			print("USING TIMESTEP",t+i+t0)
-			atoms = ase.Atoms(aseString,positions=avg+disp[t+i+t0,:,:],pbc=[True,True,True],cell=[lx,ly,lz])
+			if max(tiling)<=1:
+				atoms = ase.Atoms(aseString,positions=avg+disp[t+i+t0,:,:],pbc=[True,True,True],cell=[lx,ly,lz])
+			else:
+				av=tile(avg) ; dis=tile(disp[t+i+t0,:,:]) ; cell=[lx*tiling[0],ly*tiling[1],lz*tiling[2]]
+				aseStr="".join( [aseString]*tiling[0]*tiling[1]*tiling[2] )
+				atoms = ase.Atoms(aseStr,positions=av+dis,pbc=[True,True,True],cell=cell)
 			atomStack.append(atoms)
 		ewave(atomStack,fileSuffix="t"+str(t),plotOut=False)
 
@@ -154,13 +165,14 @@ def readInputFile(infile):
 	# READ IN THE FOLLOWING VARIABLES FROM THE INPUT FILE
 	# path,dumpfile,atomTypes,nx,ny,nz,a,b,c,dt,trim,beamAxis,flipBeam,tiling,semiAngle
 	# Note no skewed primitive cells are currently supported for tiling
-	global path, dumpfile, dumptype, useLattice, atomTypes, nx, ny, nz, a, b, c ,dt, trim, beamAxis, flipBeam, tile, maxFreq
+	global path, dumpfile, dumptype, useLattice, atomTypes, nx, ny, nz, a, b, c ,dt, trim, beamAxis, flipBeam, tile, maxFreq, nthTimestep
 	global semiAngle, outDirec, probePositions, saveExitWave, restartFrom, restartDirec, addModes, modifyProbe, modifyAtoms, numFP , slice_thickness
-	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl,deleteInputWave, cycleID
-	global concurrentTimesteps, maxTimestep ; concurrentTimesteps=10 ; maxTimestep=1000 ; numFP=1 ; deleteInputWave=False ; slice_thickness=1
+	global kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl,deleteInputWave, cycleID , calculateForces
+	global concurrentTimesteps, maxTimestep , orthogonalize , t0 , cropExitWave
+	concurrentTimesteps=10 ; maxTimestep=1000 ; numFP=1 ; deleteInputWave=False ; slice_thickness=1
 	kmask_xis,kmask_xfs,kmask_yis,kmask_yfs,kmask_cxs,kmask_cys,kmask_rad,kmask_lbl=[],[],[],[],[],[],[],[]
 	dumptype="qdump" ; probePositions=[] ; addModes={} ; useLattice=False ; modifyProbe=False ; modifyAtoms=False ; cycleID=0
-	saveExitWave=False ; restartFrom=False ; maxFreq=None
+	calculateForces=False ; orthogonalize=False ; saveExitWave=False ; restartFrom=False ; maxFreq=None ; t0=0 ; nthTimestep=1 ; cropExitWave=False
 	lines=open(infile,'r').readlines()
 	exec("".join(lines),globals())
 	kmask_lbl=kmask_lbl+[ str(v) for v in range(len(kmask_xis)+len(kmask_cxs)-len(kmask_lbl)) ]
@@ -192,10 +204,15 @@ def readInputFile(infile):
 				restartDirec=RD			# only update restartDirec once we've found the right N
 			print("RESTART SET: outDirec:",outDirec,"restartDirec",restartDirec)
 	os.makedirs(outDirec,exist_ok=True)
+
+	# e.g. your lammps timestep size was 0.0005 ps, dumped every 10th step (dt in your input file should be 0.0005*10) yielding a max frequency (1/dt/2) of 100THz. too high, waste of compute. use every-other-timestep, new dt will be 0.0005*10*2 (max frequency of 50 THz). double dt here, and importPositions will select every-other-timestep
+	if nthTimestep!=1: 
+		dt*=nthTimestep
 	shutil.copy(infile,outDirec+"/")
 
 def importPositions():
-	global velocities,ts,types,avg,disp,positions
+	# twp 2024-09-03 removing global "positions" since we shouldn't use it! use avg+disp instead! and velocities would only be used to calculate vDOS (which is w*dDOS, since u(t,x)=exp(iwt-ikx))
+	global ts,types,avg,disp,dt #velocities,positions
 
 	# read in from custom dump file, containing positions *and* velocities
 	if dumptype=="qdump":
@@ -205,21 +222,19 @@ def importPositions():
 			disp=np.load(path+"disp.npy")
 			types=np.load(path+dumpfile+"_typ.npy")
 			ts=np.load(path+dumpfile+"_ts.npy")
-			positions=avg+disp
-			velocities=np.load(path+dumpfile+"_vel.npy")
 		elif os.path.exists(path+dumpfile+"_pos.npy"): # next-best: positions npy file exists: read it, then run averaging.
 			print("reading existing npy files: pos,typ,ts")
 			positions=np.load(path+dumpfile+"_pos.npy") # note: qdump() will read these anyway, but we can skip that if they already exist
-			velocities=np.load(path+dumpfile+"_vel.npy")
 			types=np.load(path+dumpfile+"_typ.npy")
 			ts=np.load(path+dumpfile+"_ts.npy")
 			print("averaging positions")
-			avg,disp=avgPos(positions,nx*a,ny*b,nz*c) # nt, na, 3
+			avg,disp=avgPos(positions,nx*a,ny*b,nz*c) # nt, na, 3 # TODO I DON'T KNOW THAT avgPos CORRECTLY HANDLES NON-ORTHOGONALIZED CELLS
 			np.save(path+"avg.npy",avg)
 			np.save(path+"disp.npy",disp)
 		else:					# last scenario: no npy files, so read qdump file
 			print("reading dump file")
 			positions,velocities,ts,types=qdump(path+dumpfile) # this will also save off pos/types/etc npy files
+			velocities=0 # don't waste RAM storing velocities
 			print("averaging positions")
 			avg,disp=avgPos(positions,nx*a,ny*b,nz*c) # nt, na, 3
 			np.save(path+"avg.npy",avg)
@@ -231,11 +246,22 @@ def importPositions():
 	elif dumptype=="positions":
 		print("reading positions from pos file")
 		pos,types=scrapePos(path+dumpfile) # qdump positions,velocities are [nt,na,3]. avg is [na,3] and disp is [nt,na,3]
-		positions=[pos,pos]
-		velocities=np.zeros(np.shape(positions))
-		disp=np.zeros(np.shape(positions)) ; avg=pos ; ts=np.asarray([0,1])
+		disp=np.zeros((maxTimestep,len(pos),3)) ; avg=pos ; ts=np.arange(maxTimestep)
+	print("found",len(ts),"timesteps")
+	if orthogonalize:
+		for ijk,n,l in zip([0,1,2],[nx,ny,nz],[a,b,c]):
+			mask=np.zeros(len(avg)) ; mask[avg[:,ijk]<0]=1
+			avg[mask==1,ijk]+=n*l #; disp[:,xmask==1,ijk]+=n*l
+			mask=np.zeros(len(avg)) ; mask[avg[:,ijk]>=n*l]=1
+			avg[mask==1,ijk]-=n*l #; disp[:,xmask==1,0]+=nx*a
 
 	# WRAPPING: imagine a plane of atoms initialized at z=0. these atoms jiggle through the PBC, and there's a 50% chance their average is at the top vs bottom of the simulation. then when a wave hits "dangling" top atoms, we'll find asymmetry where there is none, and other strange e-wave interactions
+	# Consider the following. the 4th row of atoms has atom 0 "wrapped" around to +lx instead of being at zero where it "should be". 
+	# |o     o     o     o     |	# this results in a "fuzzy" system with dangling atoms, and when thesde are at the top, we'll detect
+	# | o    o    o       o    |	# asymmetry where there is none, and other strange e-wave interactions. 
+	# |o    o      o     o     |	# to fix this, we infer the spacing of the atoms (collect x positions, sort them, calculate distance
+	# |      o     o     o    o|	# between them, and look for the smallest distance which is not just a vibrational distance)
+	# |o    o      o    o      |	# any atoms within l/2 of the right edge can then be tossed back around to the left. 
 	# infer spacing 
 	spacing=[]
 	for i in range(3):
@@ -243,24 +269,40 @@ def importPositions():
 		dxyz=np.gradient(xyzs)		# spacing between atoms in x
 		dxyz=dxyz[dxyz>.1]		# assume jiggling is less than .1, assume no interatomic spacing is less than .1
 		spacing.append(min(dxyz))
+		print("SPACING",i,min(dxyz),max(dxyz))
 	print("INFERRED INTERATOMIC SPACING",spacing,"(used for haircut)")
-	spacing=[ s/2 for s in spacing ]
+	#spacing=[ s/2 for s in spacing ]
 	print("spacing",spacing,"nx,ny,nz",nx,ny,nz,"a,b,c",a,b,c)
 	for i in range(3):
 		mask=np.zeros(len(avg))
 		l=[nx*a,ny*b,nz*c][i]
-		mask[avg[:,i]>l-spacing[i]]=1
+		mask[avg[:,i]>=l-spacing[i]/2]=1
 		print("haircut applied to",len(mask[mask==1]),"atoms")
 		avg[mask==1,i]-=l
+	#avg[:,i]+=spacing[i]/2 # ALSO SHIFT EVERYTHING BY HALF A SPACING, TO ENSURE UNWRAPPED STUFF DOESN'T GET REWRAPPED BY ASE???
 	outToPositionsFile(outDirec+"/haircutchecker.pos",avg,types,nx*a,ny*b,nz*c,list(range(1,len(set(types))+1)))
 
+	# e.g. you ran your MD simulation with timesteps of 0.0005 ps dumping every 10, which is a max frequency of 1/(.0005*10)/2=100 THz and you don't care about frequencies above 50. if you process every timestep, you're wasting time (and need to process way more timesteps to get the same frequency resolution, e.g. 400 timesteps to get 0.5 THz resolution (-100 to 100 THz / 400 = 0.5 THz). Instead, use every-other timestep. easiest way to handle that is just select every-nth velocity/displacement and double the passed dt. now you have *effectively* run with 0.0005 ps timesteps dumping every 20, max frequency 1/(.0005*20)/2=50THz max, only need to process 200 (corrected) timesteps to get 0.5 THz resolution (-50 to 50 THz / 200 = 0.5 THz)
+	if nthTimestep!=1:
+		print("ts",ts)
+		disp=disp[::nthTimestep] # ts=ts[::nthTimestep] # ts is just timestep indices 1,2,3,..., so DON'T grab every-other
+		#dt*=nthTimestep # WE'RE ACTUALLY GOING TO DO THIS IN readInputFile(), SO OTHER FUNCTIONS LIKE sliceE WILL HEAR ABOUT THE NEW dt
+
 	if "A" in addModes.keys(): # addModes={"THz":[...],"iA":[...],"pdirec":[...],"vdirec":[...],"phase":[...]}
+		pltX=np.linspace(0,20,100) ; pltY=[] ; pltlbl=[]
 		for i in range(len(addModes["A"])):
 			A,k,w,p,v,phi=[ addModes[key][i] for key in ["A","k","w","pdirec","vdirec","phase"] ]
 			print("add wave A:",A,"k",k,"w",w,"x",p,"phi",phi)
 			addWave(A,k,w,phi,p,v)
+			pltY.append(A*np.sin(k*pltX*2*np.pi+phi))
+			pltlbl.append("A: "+str(np.round(A,5))+", k: "+str(np.round(k,5))+", phi: "+str(np.round(phi,5)))
 			#avg[:,:]+=added[:,:]
 			#disp[:
+		pltX=[pltX]*len(pltY) ; mkrs=['-']*len(pltY)
+		if "atomSpacing" in addModes.keys():
+			pltX.append(np.arange(20//addModes["atomSpacing"])*addModes["atomSpacing"])
+			pltY.append(pltX[-1]*0) ; mkrs.append(".") ; pltlbl.append("")
+		plot(pltX,pltY,markers=mkrs,labels=pltlbl,filename=outDirec+"/addModes.png")
 
 def addWave(A,k,w,phi,p_xyz,v_xyz):
 	na=len(avg)
@@ -293,19 +335,24 @@ def addWave(A,k,w,phi,p_xyz,v_xyz):
 #flipBeam=False	# default is to look from +z towards -z, but we can mirror the simulation too (e.g. if we're more sensitivity to top layers)
 # TODO TECHNICALLY OUR IMPLEMENTATION OF beamAxis AND flipBeam ARE WRONG. swapping axes is effectively mirroring across a 45° plane, and flibBeam mirrors across one of the three cartesian planes. mirroring is wrong though, think about chirality: you'll flip handedness
 def preprocessPositions():
-	global positions,velocities,ts,types,avg,disp,a,b,c,nx,ny,nz,tiling
+	global positions,ts,types,avg,disp,a,b,c,nx,ny,nz,tiling
 
 	# TRIM A TOO-BIG VOLUME
 	for ijk,lims in enumerate(trim):
 		if len(lims)!=2:
 			continue
+		if lims[0]<0:
+			lims[0]=0
+		n=[nx,ny,nz][ijk]
+		if lims[1]>n:		# is user is a doofus (or mistypes) a tiling greater than the simulation size, just ignore it.
+			lims[1]=n
 		abc=[a,b,c][ijk]
 		xs=avg[:,ijk] ; xi=lims[0]*abc ; xf=lims[1]*abc
 		print("TRIM:",ijk,xi,xf)
 		mask=np.zeros(len(xs))
 		mask[xs>=xi]=1 ; mask[xs>=xf]=0
 		#mask[xs>=xi]=1 ; mask[xs>=xi+2]=0 ; mask[xs>=xf-2]=1 ; mask[xs>=xf]=0 # CUSTOM MASK MOD TO CLEAR OUT ATOMS SO WE CAN VISUALIZE THE PROBE
-		avg=avg[mask==1,:] ; disp=disp[:,mask==1,:] ; velocities=velocities[:,mask==1,:] ; types=types[mask==1]
+		avg=avg[mask==1,:] ; disp=disp[:,mask==1,:] ; types=types[mask==1]
 		avg[:,ijk]-=xi
 		if ijk==0:
 			nx=lims[1]-lims[0]
@@ -319,24 +366,34 @@ def preprocessPositions():
 		rollby=[-1,1][beamAxis] # to look down x, roll -1 [x,y,z] --> [y,z,x]. to look down y, roll +1 [x,y,z] --> [z,x,y]
 		avg=np.roll(avg,rollby,axis=1) # na,[x,y,z] --> na,[y,z,x]
 		disp=np.roll(disp,rollby,axis=2) # nt,na,[x,y,z] --> nt,na,[y,z,x]
-		velocities=np.roll(velocities,rollby,axis=2) 
 		a,b,c=np.roll([a,b,c],rollby)
 		nx,ny,nz=np.roll([nx,ny,nz],rollby)
 		tiling=np.roll(tiling,rollby)
 	if flipBeam:
 		avg[:,2]*=-1 ; avg[:,2]+=nz*c # # na,[x,y,z], flip z, shift position
 		disp[:,:,2]*=-1 # # nt,na,[x,y,z], no shift for displacements or velo
-		velocities[:,:,2]*=-1
 
 	if modifyAtoms:
 		modifyAtoms()
 
-def matstrip(ary): # strip all len==1 indices out of an N-D array. shape 2,1,3,4,1,7 turns into shape 2,3,4,7. useful for getting rid of spurious axes
-	shape=np.asarray(np.shape(ary))
-	ones=np.where(shape==1)[0]
-	for i in reversed(ones):
-		ary=np.sum(ary,axis=i)
-	return ary
+# replaced with np.squeeze
+#def matstrip(ary): # strip all len==1 indices out of an N-D array. shape 2,1,3,4,1,7 turns into shape 2,3,4,7. useful for getting rid of spurious axes
+#	shape=np.asarray(np.shape(ary))
+#	ones=np.where(shape==1)[0]
+#	for i in reversed(ones):
+#		ary=np.sum(ary,axis=i)
+#	return ary
+
+def psiFileName(fileSuffix):
+	lookForFile=outDirec+"/psi_"+fileSuffix # suffix order is: e/t, l, p. e/t will have been passed by caller (fileSuffix)
+	if layerwise!=0:
+		lookForFile=lookForFile+"_l0"
+	npts=1
+	if semiAngle!=0 and len(probePositions)>1:
+		npts=len(probePositions)
+		lookForFile=lookForFile+"_p0"
+	lookForFile=lookForFile+".npy" # "psi_[fileSuffix]_[lN]_[pN].npy"
+	return lookForFile
 
 # SIMULATE E WAVES THROUGH A LIST OF ASE CONFIGURATIONS
 # 1. create the potential from the atomic configuration(s)
@@ -354,14 +411,7 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 	print("ewave",fileSuffix)
 
 	# CHECK IF THIS HAS ALREADY BEEN RUN (note layerwise!=0 len(probePositions)!=1 runs all layers and probe positions in parallel, then we save off individually, SO, we just have to look for l0 and/or p0)
-	lookForFile=outDirec+"/psi_"+fileSuffix # suffix order is: e/t, l, p. e/t will have been passed by caller (fileSuffix)
-	if layerwise!=0:
-		lookForFile=lookForFile+"_l0"
-	npts=1
-	if semiAngle!=0 and len(probePositions)>1:
-		npts=len(probePositions)
-		lookForFile=lookForFile+"_p0"
-	lookForFile=lookForFile+".npy" # "psi_[fileSuffix]_[lN]_[pN].npy"
+	lookForFile=psiFileName(fileSuffix)
 	print("lookForFile",lookForFile)
 	if os.path.exists(lookForFile):
 		print("FIRST PSI-FILE FOUND FOR THIS CHUNK. SKIPPING",lookForFile)
@@ -384,7 +434,7 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 	ys=np.linspace(0,potential_phonon._grid.extent[1],potential_phonon._grid.gpts[1],endpoint=False)
 	if not os.path.exists(outDirec+"/xs.npy"):
 		np.save(outDirec+"/xs.npy",xs) ; np.save(outDirec+"/ys.npy",ys)
-	nLayers=1
+	nLayers=1 ; npts=1
 	if layerwise!=0:
 		nslices=potential_phonon.num_slices # 14.5 Å --> potential divided into 33 layers
 		nth=nslices//layerwise # 33 layers, user asked for 10? 33//10 --> every 3rd layer --> 11 layers total. 
@@ -401,6 +451,7 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 		print("preview potential")
 		potential_phonon.show() ; plt.savefig(outDirec+"/potential.png")
 	print("potential extent:",potential_phonon.extent) #; sys.exit()
+
 	# STEP 2 DEFINE PROBE (or plane wave)
 	if restartFrom:
 		wavefile=restartDirec+"/ewave_"+fileSuffix+".npy" # TODO FOR NOW, WE'RE NOT ALLOWING RESTART FROM npts>1 OR nLayers>1
@@ -417,13 +468,14 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 		entrance_waves.grid.match(potential_phonon) 
 	
 	elif semiAngle!=0: # CONVERGENT PROBE INSTEAD OF PLANE WAVE (needs probe defined, and scan to denote where probe is positioned)
-		probe = abtem.Probe(energy=100e3, semiangle_cutoff=semiAngle) # semiangle_cutoff is the convergence angle of the probe
+		probe = abtem.Probe(energy=100e3, semiangle_cutoff=semiAngle)#, C12=20, C10=100) # semiangle_cutoff is the convergence angle of the probe
 		probe.grid.match(potential_phonon)
 		print(probe.gpts)
 
+		# TODO IF YOU HAVE A GIANT SIMULATION AREA, THIS (or subsequently calculating exit waves if you comment this out) WILL CRASH. I ASSUME BECAUSE THE PROBE IS "ZERO MAGNITUDE" FAR FROM THE CENTER?
 		if plotOut:
 			print("preview probe")
-			probe.show() ; plt.savefig(outDirec+"/probe.png")
+			probe.show() ; plt.savefig(outDirec+"/probe.png") # IF YOU CRASH HERE WITH "integer modulo by zero" TRY TRIMMING YOUR SIM VOLUME
 
 		# STEP 3, PROBE POSITION (user defined, or center of the sim volume)
 		if len(probePositions)>0:
@@ -438,15 +490,17 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 			Z=probewave.array ; nx,ny=np.shape(Z)
 			LX,LY=probe.extent
 			xs=np.linspace(-LX/2,LX/2,nx) ; ys=np.linspace(-LY/2,LY/2,ny)
-			modifyProbe(Z,xs,ys) # TODO WHY IS OUR PROBE BEING AFFECTED BY THE POTENTIAL? see hBN_0m_04
-			contour(np.real(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png")
-			contour(np.imag(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png")
+			modifyProbe(Z,xs,ys)
+			probewave = abtem.Waves(array=Z, energy=100e3, extent=potential_phonon.extent, sampling=potential_phonon.sampling)
+			if plotOut:
+				contour(np.real(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png",aspect=1,heatOrContour="pix")
+				contour(np.imag(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png",aspect=1,heatOrContour="pix")
+				fftd,ky,kx=fft2(probewave.array,ys,xs,maxrad/100) # nicecontour > FFT2 expects y,x index ordering. 
+				contour(fftd.real.T,kx,ky,xlabel="kx ($\AA$^-1)",ylabel="ky ($\AA$^-1)",title="Real(rprobe)",filename=outDirec+"/rprobe_Re.png",aspect=1,heatOrContour="pix")
+				contour(fftd.imag.T,kx,ky,xlabel="kx ($\AA$^-1)",ylabel="ky ($\AA$^-1)",title="Imag(probe)",filename=outDirec+"/rprobe_Im.png",aspect=1,heatOrContour="pix")
 
 	else: # PLANE WAVE INSTEAD OF CONVERGENT PROBE (just define the plane wave params)
 		plane_wave = abtem.PlaneWave(energy=100e3, sampling=0.05)
-
-
-
 
 	if plotOut:
 		atoms=atomStack[0]
@@ -519,19 +573,27 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 					waveout=waveout[:,l,:,:]
 				if npts>1:
 					waveout=waveout[:,p,:,:]
-				np.save(wavefile,matstrip(waveout))
+				waveout=np.squeeze(waveout)
+				if cropExitWave: # e.g. [[0,10],[0,10]] to crop to the first 10x10 unit cells in x,y when saving (reduces file sizes)
+					(xi,xf),(yi,yf)=cropExitWave ; xi*=a ; xf*=a ; yi*=b ; yf*=b
+					xmask=np.zeros(len(xs)) ; xmask[xs>=xi]=1 ; xmask[xs>xf]=0
+					ymask=np.zeros(len(ys)) ; ymask[ys>=yi]=1 ; ymask[ys>yf]=0
+					waveout=waveout[xmask==1,:][:,ymask==1]	# masking by rows and columns instead of a 2D mask means we keep it 2D
+				np.save(wavefile,np.squeeze(waveout))
 
 	# STEP 5 CONVERT TO DIFFRACTION SPACE
 	print("converting exit wave to k space",end=" ")
 	sys.stdout.flush() # https://stackoverflow.com/questions/35230959/printfoo-end-not-working-in-terminal
 	start=time.time()
-	diffraction_complex = exit_waves.diffraction_patterns(max_angle=maxrad,block_direct=False,return_complex=True)
-	kx=diffraction_complex.sampling[-2]*diffraction_complex.shape[-2]/2 ; ky=diffraction_complex.sampling[-1]*diffraction_complex.shape[-1]/2
-	kxs=np.linspace(-kx,kx,diffraction_complex.shape[-2]) ; kys=np.linspace(-ky,ky,diffraction_complex.shape[-1])
+	#diffraction_complex = exit_waves.diffraction_patterns(max_angle=maxrad,block_direct=False,return_complex=True)
+	#zr=diffraction_complex.array
+	#kx=diffraction_complex.sampling[-2]*diffraction_complex.shape[-2]/2 ; ky=diffraction_complex.sampling[-1]*diffraction_complex.shape[-1]/2
+	#kxs=np.linspace(-kx,kx,diffraction_complex.shape[-2]) ; kys=np.linspace(-ky,ky,diffraction_complex.shape[-1])
+	zr,kys,kxs=fft2(exit_waves.array,ys,xs,maxrad/100) # using nicecontour's FFT2 function, which expects y,x indices
+
 	if not os.path.exists(outDirec+"/kxs.npy"):
 		np.save(outDirec+"/kxs.npy",kxs) ; np.save(outDirec+"/kys.npy",kys)
 	print("took:",time.time()-start)
-	zr=diffraction_complex.array
 
 	print("saving off psi",end=" ")
 	sys.stdout.flush() # https://stackoverflow.com/questions/35230959/printfoo-end-not-working-in-terminal
@@ -553,7 +615,7 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 				zo=zr[:,l]
 			if npts>1:
 				zo=zo[:,p]
-			zo=matstrip(zo)
+			zo=np.squeeze(zo)
 			np.save(psifile,zo)
 	print("took:",time.time()-start)
 
@@ -561,6 +623,8 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 		print("delete previous input wave file")
 		os.remove(restartDirec+"/ewave_"+fileSuffix+".npy")
 	#return zr # even if layerwise!=0, we'll end up with the last (thickest) psi. 
+
+	# SEE OLD VERSION 0.20 FOR CALCULATE FORCES
 
 # END SHARED FUNCTIONS
 
@@ -581,7 +645,7 @@ def generateEnergyMasks(fmin,fmax,numBands,bandWidth=0):
 		# STEP 2, APPLY A FREQUENCY BAND-PASS TO DISPLACEMENTS TO ENABLE FROZEN-PHONON ABTEM SIMS IN THE SPIRIT OF ZEIGER'S FREQUENCY-ISOLATED THERMOSTAT
 		print("FFTing positions and velocities")
 		dfft=np.fft.fft(disp,axis=0) # FFT on displacements tells displacements associated with each frequency. THIS IS JUST EIGENVECTOR?
-		vfft=np.fft.fft(velocities,axis=0) # FFT on displacements tells displacements associated with each frequency. THIS IS JUST EIGENVECTOR?
+		#vfft=np.fft.fft(velocities,axis=0) # FFT on displacements tells displacements associated with each frequency. THIS IS JUST EIGENVECTOR?
 		ws=np.fft.fftfreq(len(ts),ts[1]-ts[0])
 		n=int(len(ws)/2)
 		ws/=dt # convert to THz: e.g. .002 picosecond timesteps, every 10th timestep logged
@@ -698,6 +762,19 @@ def getFPconfigs(disp_bandpass,plotOut=False):
 			abtem.show_atoms(atoms,plane="yz"); plt.title("side view") ; plt.savefig(outDirec+"/configpics/"+str(plotOut)+"_side.png")
 	return atomStack
 
+def tile(pos): # a,xyz
+	lx,ly,lz=a*nx,b*ny,c*nz
+	if max(tiling)<=1:
+		return pos
+	cloned=[]
+	for i in range(tiling[0]):
+		for j in range(tiling[1]):
+			for k in range(tiling[2]):
+				translate=np.asarray([i*lx,j*ly,k*lz])
+				cloned.append(pos+translate)
+
+	return np.reshape(cloned,(len(pos)*len(cloned),3)) # whichTile,whichAtom,xyz --> moreAtoms,xyz
+
 # given a 3D matrix (nFP,kx,ky), perform coherent/incoherent averaging
 # COMPARING TO ZEIGER PRB 104, 104301 (2021) : They list:
 # They use Ψ(q,r,R), where q is momentum, r is position of STEM probe, R is frozen-phonon configurations
@@ -747,8 +824,10 @@ def sliceE(nth=1):
 			if i%nth!=0:
 				continue
 			if (maxFreq is not None) and ( ws[i]>maxFreq or ws[i]<-1*maxFreq ):
-				continue	
-			contour(np.absolute(psi[i]).T,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(ws[i])+" THz",aspect=1)#,zlim=zlim,cmap='Spectral')
+				continue
+			out=np.absolute(psi[i])
+			#out=np.arctan2(np.real(psi[i]),np.imag(psi[i]))
+			contour(out.T,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(np.round(ws[i],2))+" THz",aspect=1,heatOrContour="pix")#,zlim=zlim,cmap='Spectral')
 
 def sliceE2(nth=1):
 	ws=np.load(outDirec+"/ws.npy")
@@ -786,7 +865,7 @@ def sliceE2(nth=1):
 #   .'      o   	    where selectivity rules will show T modes only in
 #           |  		    the first BZ.
 def loopDispersions():
-	lines=open(outDirec+"/dispersions/dispersions.txt")
+	lines=open(outDirec+"/dispersions.txt")
 	global m,xi,yi,xlim,ylim,title
 	for l in lines:
 		l=l.lstrip("#").strip()
@@ -840,7 +919,7 @@ def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None):
 			if x<xlim[0] or x>xlim[1] or y<ylim[0] or y>ylim[1]:
 				continue
 			i=np.argmin(np.absolute(kxs-x)) ; ijs.append([i,j])
-	
+
 	for fs in chunks:
 		print("load ivib/diff")
 		psi=np.load(fs[0]) ; filelabel=fs[0].split("/")[-1].replace("ivib","").replace(".npy","")
@@ -854,14 +933,21 @@ def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None):
 		psi[ws>=0]*=ws[ws>=0,None,None]
 		psi[ws<0]*=-1*ws[ws<0,None,None]
 
-		overplot={"xs":[],"ys":[],"kind":"line","color":"r","linestyle":":"} 
+		#overplot={"xs":[],"ys":[],"kind":"line","color":"r","linestyle":":"} 
+		overplot={"xs":[],"ys":[],"kind":"scatter","color":"r","marker":"."} 
 		sliced=[] ; ks=[]
 		for n,ij in enumerate(tqdm(ijs)):
 			i,j=ij
 			sliced.append(psi[:,i,j])
 			distance=np.sqrt((kxs[i]-xi)**2+(kys[j]-yi)**2)
 			sign=1
-			if m>=0 and ( kxs[i]-xi < 0 or kys[j]-yi < 0 ):
+			if (m>=0 and m<=1) and ( kxs[i]-xi < 0 ): 	#    .-'  / (both positive
+				sign=-1					# -'     /   slope, but 
+			if (m>1) and ( kys[j]-yi < 0 ):			#   vs  /   check x or y)
+				sign=-1
+			if (m<0 and m>=-1) and ( kxs[i]-xi < 0 ):
+				sign=-1
+			if (m<-1) and ( kys[j]-yi < 0 ):
 				sign=-1
 			ks.append(distance*sign)
 			overplot["xs"].append(kxs[i]) ; overplot["ys"].append(kys[j])
@@ -870,13 +956,17 @@ def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None):
 		sliced=np.absolute(sliced)
 		sliced[sliced==0]=np.amin(sliced[sliced>0])
 		#print(np.amax(sliced),np.amin(sliced))
-		contour(np.log(diff).T,kxs,kys,filename=outDirec+"/dispersions/"+title+"_disp_linescan"+filelabel+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="dispersion masked diffraction image",overplot=[overplot],)
-		contour(np.sqrt(sliced).T,ks,ws,xlabel="k ($\AA$^-1)",ylabel="frequency (THz)",title="dispersion",filename=outDirec+"/dispersions/"+title+"_dispersion"+filelabel+".png") # i prefer sqrt scale to log scale, as it sort of "equalizes" big numbers
+		contour(np.log(diff).T,kxs,kys,filename=outDirec+"/dispersions/"+title+"_disp_linescan"+filelabel+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="dispersion masked diffraction image",overplot=[overplot],heatOrContour="pix")
+		contour(np.sqrt(sliced).T,ks,ws,xlabel="k ($\AA$^-1)",ylabel="frequency (THz)",title="dispersion",filename=outDirec+"/dispersions/"+title+"_dispersion"+filelabel+".png",heatOrContour="pix") # i prefer sqrt scale to log scale, as it sort of "equalizes" big numbers
+		np.save(outDirec+"/dispersions/"+title+"_dispersion"+filelabel+"_Zs.npy",sliced)
+		np.save(outDirec+"/dispersions/"+title+"_dispersion"+filelabel+"_ks.npy",ks)
+		np.save(outDirec+"/dispersions/"+title+"_dispersion"+filelabel+"_ws.npy",ws)
+
 
 def diffraction():
 	kxs=np.load(outDirec+"/kxs.npy")
 	kys=np.load(outDirec+"/kys.npy")
-	os.makedirs(outDirec+"/slices",exist_ok=True)
+	#os.makedirs(outDirec+"/slices",exist_ok=True)
 
 	# reading and grouping psi files (instead of ivib files) via psiFileNames assumes certain parameters depending on mode
 	if mode=="PZ":
@@ -887,16 +977,15 @@ def diffraction():
 	chunks=psiFileNames(prefix="psi")
 	print(chunks)
 	for fs in chunks:
-		psis=[]
-		for f in fs: # either psi_e or psi_t, either loop through energy, or time chunks
-			psi=np.load(f) 
+		diff=np.zeros((len(kxs),len(kys)))
+		for f in tqdm(fs): # either psi_e or psi_t, either loop through energy, or time chunks
+			psi=np.load(f)
 			if len(np.shape(psi))==2:
-				psis.append(psi)
+				diff+=np.absolute(psi)
 			else:
 				for p in psi:	# for each energy or timechunk, loop through individual FP configs, or individual timesteps. 
-					psis.append(p)
+					diff+=np.absolute(p)
 		fo=fs[0].replace("_t0","").replace("_e0","").replace(".npy","").replace("psi","diff")
-		diff=np.sum(np.absolute(psis),axis=0)
 		np.save(fo+".npy",diff)
 		contour(np.log(diff).T,kxs,kys,filename=fo+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="diffraction image")#,zlim=zlim,cmap='Spectral')
 			#contour(np.log(np.absolute(sliced)),kxs,ws)
@@ -987,6 +1076,45 @@ def cyclesToLayers():
 	print("PLEASE RUN \"python3 abEELS.py "+newInputFile+"\" before attempting any post-processing (this creates required ivib files)")
 	#print("YOU MAY NOW RUN POST-PROCESSING ON COMBINED RUN: e.g. \"python3 DOS inputs/"+sys.argv[-1].replace(".txt","_combined.txt")+"\"")
 
+def JACRAverager():
+	direcsIn=["Si_5m_09a","Si_5m_09b","Si_5m_09c","Si_5m_09d","Si_5m_09e","Si_5m_09f","Si_5m_09g","Si_5m_09h","Si_5m_09i","Si_5m_09j"]
+	direcOut="Si_5m_09aj"
+	global outDirec ; outDirec="outputs/"+direcOut				# 
+	os.makedirs(outDirec,exist_ok=True)					# create output folder
+	shutil.copy("inputs/"+direcsIn[0]+".txt","inputs/"+direcOut+".txt")	# create dummy input file (from first direcIn)
+	for f in [ "kxs.npy","kys.npy","ws.npy","xs.npy","ys.npy"]:		# copy in files we'll want for processing later
+		shutil.copy("outputs/"+direcsIn[0]+"/"+f,outDirec)
+	ivibs=[ np.load("outputs/"+d+"/ivib.npy") for d in direcsIn ]			# read in each ivib data cube (ws,kx,ky)
+	ivib=np.mean(ivibs,axis=0)
+	np.save(outDirec+"/ivib.npy",ivib)
+
+# IF YOU RUN OUT OF RAM AT THE END OF JACR (for example) BECAUSE YOU HAVE A LOT OF HUGE PSIS, USE THIS TO TRIM IN K SPACE
+def trimPsisToIvib():
+	kxi=-1 ; kxf=1 ; kyi=-1 ; kyf=1
+	kx=np.load(outDirec+"/kxs.npy") ; ky=np.load(outDirec+"/kys.npy")
+	shutil.copy(outDirec+"/kxs.npy",outDirec+"/kxs_original.npy")
+	shutil.copy(outDirec+"/kys.npy",outDirec+"/kys_original.npy")
+	i1=len(kx[kx<=kxi])-1 ; i2=len(kx[kx>=kxf])-1
+	j1=len(ky[ky<=kyi])-1 ; j2=len(ky[ky>=kyf])-1
+	kx=kx[i1:-i2] ; ky=ky[j1:-j2]
+	np.save(outDirec+"/kxs.npy",kx) ; np.save(outDirec+"/kys.npy",ky)
+	diff=np.load(outDirec+"/diff.npy")
+	shutil.copy(outDirec+"/diff.npy",outDirec+"/diff_original.npy")
+	diff=diff[i1:-i2,j1:-j2]
+	np.save(outDirec+"/diff.npy",diff)
+	psi_t=np.zeros((maxTimestep,len(kx),len(ky)),dtype=complex)
+	for i in tqdm(range(maxTimestep)):
+		psi_t[i,:,:]=np.load(outDirec+"/psi_t"+str(i)+".npy")[i1:-i2,j1:-j2]
+	psi=np.fft.fft(psi_t-np.mean(psi_t,axis=0),axis=0)
+	ws=np.fft.fftfreq(n=len(psi_t))
+	print(dt)
+	ws/=dt # convert to THz: e.g. .002 picosecond timesteps, every 10th timestep logged
+	if not os.path.exists(outDirec+"/ws.npy"):
+		np.save(outDirec+"/ws.npy",ws)
+	outname=outDirec+"/ivib.npy"
+	np.save(outname,psi)
+
+
 funcAliases={"DOS":"eDOS"}
 # if called directly, run main(). does not run if imported "from abEELS import *"
 if __name__=='__main__':
@@ -1000,8 +1128,10 @@ if __name__=='__main__':
 		else:
 			main_PZ()
 	else:
-		fun=sys.argv[1] 
-		if fun in funcAliases:
-			fun = funcAliases[ fun ]
-		command=fun+"()"
-		exec(command)
+		# you can pass a comma-delimited list of functions. e.g. "python3 abEELS main_JACR,diffraction,sliceE inputs/inputFile.txt",
+		funs=sys.argv[1].split(",") 
+		for fun in funs:
+			if fun in funcAliases:
+				fun = funcAliases[ fun ]
+			command=fun+"()"
+			exec(command)
