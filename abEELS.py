@@ -487,15 +487,21 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 
 		if modifyProbe: # your input file can define a function which does an in-place modify of the complex probe function! 
 			probewave=probe.build(custom_scan).compute()
-			Z=probewave.array ; nx,ny=np.shape(Z)
+			Z=probewave.array ; nx,ny=np.shape(Z)[-2:]
 			LX,LY=probe.extent
 			xs=np.linspace(-LX/2,LX/2,nx) ; ys=np.linspace(-LY/2,LY/2,ny)
 			modifyProbe(Z,xs,ys)
-			probewave = abtem.Waves(array=Z, energy=100e3, extent=potential_phonon.extent, sampling=potential_phonon.sampling)
+			#probewave = abtem.Waves(array=Z, energy=100e3, extent=potential_phonon.extent, sampling=potential_phonon.sampling)
 			if plotOut:
-				contour(np.real(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png",aspect=1,heatOrContour="pix")
-				contour(np.imag(probewave.array).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png",aspect=1,heatOrContour="pix")
-				fftd,ky,kx=fft2(probewave.array,ys,xs,maxrad/100) # nicecontour > FFT2 expects y,x index ordering. 
+				pr=probewave.array
+				print("probewave",pr.shape)
+				while len(pr.shape)>2:
+					print("probewave",pr.shape)
+					pr=pr[0,:,:]
+					print("probewave",pr.shape)
+				contour(np.real(pr).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Real(probe)",filename=outDirec+"/probe_Re.png",aspect=1,heatOrContour="pix")
+				contour(np.imag(pr).T,xs,ys,xlabel="x ($\AA$)",ylabel="y ($\AA$)",title="Imag(probe)",filename=outDirec+"/probe_Im.png",aspect=1,heatOrContour="pix")
+				fftd,ky,kx=fft2(pr,ys,xs,maxrad/100) # nicecontour > FFT2 expects y,x index ordering. 
 				contour(fftd.real.T,kx,ky,xlabel="kx ($\AA$^-1)",ylabel="ky ($\AA$^-1)",title="Real(rprobe)",filename=outDirec+"/rprobe_Re.png",aspect=1,heatOrContour="pix")
 				contour(fftd.imag.T,kx,ky,xlabel="kx ($\AA$^-1)",ylabel="ky ($\AA$^-1)",title="Imag(probe)",filename=outDirec+"/rprobe_Im.png",aspect=1,heatOrContour="pix")
 
@@ -507,7 +513,9 @@ def ewave(atomStack,fileSuffix,plotOut=False):
 		abtem.show_atoms(atoms,plane="xy"); plt.title("beam view")
 		if semiAngle!=0:
 			if len(probePositions)>0:
-				plt.plot(*np.asarray(probePositions).T)
+				#plt.plot(*np.asarray(probePositions).T)
+				for i,p in enumerate(probePositions):
+					plt.plot([p[0]],[p[1]]) ;  plt.annotate(str(i),p)
 			else:
 				plt.plot(box[0]/2,box[1]/2)
 		plt.savefig(outDirec+"/beam.png")
@@ -899,7 +907,7 @@ def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None):
 		#m=np.inf ; xi=2/a ; yi=0 ; xlim=[0,6/a] ; ylim=[0,6/b] 	; title="Mo" 	# AlN, Xc
 
 	#psi=np.load(outDirec+"/ivib.npy")
-	ws=np.load(outDirec+"/ws.npy")
+	#ws=np.load(outDirec+"/ws.npy")
 	kxs=np.load(outDirec+"/kxs.npy")
 	kys=np.load(outDirec+"/kys.npy")
 
@@ -924,6 +932,7 @@ def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None):
 		print("load ivib/diff")
 		psi=np.load(fs[0]) ; filelabel=fs[0].split("/")[-1].replace("ivib","").replace(".npy","")
 		diff=np.load(outDirec+"/diff"+filelabel+".npy")
+		ws=np.load(outDirec+"/ws.npy") # reload ws each time inside the loop just in case we trimmed it last cycle
 		#print(np.amax(psi),np.nanmax(psi),np.amin(psi),np.nanmin(psi))
 
 		if maxFreq is not None:
