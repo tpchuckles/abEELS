@@ -23,6 +23,7 @@ def contour(zvals,xvals,yvals,filename='',heatOrContour="heat",useLast=False,ext
 
 	# 1D DATASET PASSED, USE TRIANGULATION INTERPOLATION
 	if isinstance(zvals[0],int) or isinstance(zvals[0],float):
+		print("triangulating")
 		# Create grid values first.
 		xi = np.linspace(min(xvals), max(xvals), 1000)
 		yi = np.linspace(min(yvals), max(yvals), 1000)
@@ -32,7 +33,11 @@ def contour(zvals,xvals,yvals,filename='',heatOrContour="heat",useLast=False,ext
 		Xi, Yi = np.meshgrid(xi, yi)
 		zi = interpolator(Xi, Yi)
 		#plt.tricontourf(xvals,yvals,zvals) ; plt.show()
-		xvals=Xi ; yvals=Yi ; zvals=zi
+		xvals=Xi[0,:] ; yvals=Yi[:,0] ; zvals=zi
+		if kwargs.get("returnTriangulated",False):
+			print("return!")
+			return zvals,xvals,yvals
+		#print(xvals)
 	else: 
 		lens=[ len(z) for z in zvals ]
 		# 2D RAGGED DATASET, USE 1D INTERPOLATION TO GRIDIFY
@@ -88,6 +93,15 @@ def contour(zvals,xvals,yvals,filename='',heatOrContour="heat",useLast=False,ext
 		mask=np.ones(np.shape(zvals))
 		xlim=kwargs.get("xlim",[min(xvals),max(xvals)])
 		ylim=kwargs.get("ylim",[min(yvals),max(yvals)])
+		if xlim[0] is None:
+			xlim[0]=min(xvals)
+		if xlim[1] is None:
+			xlim[1]=max(xvals)
+		if ylim[0] is None:
+			ylim[0]=min(yvals)
+		if ylim[1] is None:
+			ylim[1]=max(yvals)
+
 		mask[:,xvals<xlim[0]]=0 ; mask[:,xvals>xlim[1]]=0
 		mask[yvals<ylim[0],:]=0 ; mask[yvals>ylim[1],:]=0
 		cropped=zvals[mask==1]
@@ -151,23 +165,26 @@ def contour(zvals,xvals,yvals,filename='',heatOrContour="heat",useLast=False,ext
 		#if yvals[0]<yvals[1]:		# BEWARE: imshow displays with origin in upper-left. and imshow takes extent, not the actual
 		#	zvals=zvals[::-1,:]	# col-by-col and row-by-row values. So if you have ascending yvals or descending xvals, heat or 
 		#if xvals[0]>xvals[1]:		# contour modes would be correct, but the pix map would be flipped. so we need to manually
-		#	zvals=zvals[:,::-1]	# detect and flip zvals as appropriate
+		#	zvals=zvals[:,::-1]	# detect and flip zvals as appropriate DOING IT BASED ON SINGLE PIXEL PAIRS IS BAD THOUGH
 		zvals[zvals<LB]=np.nan ; zvals[zvals>UB]=np.nan
-		# SUPPOSE THE USER PASSED: xvals=[1,2,3,4,5,-5,-4,-3,-2,-1] (common if it's frequencies that came from np.fft.fftfreq!). imshow simply shows the image, but we need to reorder the columns!
-		zvals_sorted=np.zeros(np.shape(zvals))
+		# AUTO SORTING OF ROWS AND COLUMNS? 
+		# Suppose the user passed: xvals=[1,2,3,4,5,-5,-4,-3,-2,-1] (common if it's frequencies that came from np.fft.fftfreq!). imshow simply shows the image, but we need to reorder the columns!
+		# calculate ordering of rows/columns
 		x_indices=np.arange(len(xvals)) ; xvals, x_indices = zip(*sorted(zip(xvals, x_indices)))	# x_indices will be: 5,6,7,8,9,0,1,2,3,4
-		for i,ii in enumerate(x_indices):								# i=0, ii=5
-			zvals_sorted[:,i]=zvals[:,ii]								# put values in column 5 into column 0
-		zvals=zvals_sorted
-		zvals_sorted=np.zeros(np.shape(zvals))
+		# apply indices. previously we did this: (but why?)
+		#for i,ii in enumerate(x_indices):								# i=0, ii=5
+		#	zvals_sorted[:,i]=zvals[:,ii]								# put values in column 5 into column 0
+		#zvals=zvals_sorted
+		zvals=zvals[:,x_indices]
 		y_indices=np.arange(len(yvals)) ; yvals, y_indices = zip(*sorted(zip(yvals, y_indices)))
-		for i,ii in enumerate(y_indices):
-			zvals_sorted[i,:]=zvals[ii,:]
-		zvals=zvals_sorted[::-1,:]									# for y, imshow displays with origin in upper-left! we need to invert ys
+		zvals=zvals[y_indices,:]
+		# BEWARE: imshow displays with origin in upper-left. and imshow takes extent, not the actual col-by-col and row-by-row values. We just sorted zvals to have ascending yvals and ascending xvals, so now we need to flip the pix map 
+		zvals=zvals[::-1,:]
+		
 		plt.imshow(zvals,extent=(min(xvals),max(xvals),min(yvals),max(yvals)),cmap=kwargs.get("cmap",defaultcmap),aspect=aspect)
 		#cbar=plt.colorbar(ticks=ticks)
-		if len(np.shape(zvals))<3:
-			addcbar(kwargs)
+		#if len(np.shape(zvals))<3:
+		addcbar(kwargs)
 	#if useLast:
 	#	print(CS.collections)
 
@@ -262,6 +279,22 @@ def fillHoles(Zs):
 			Zs[y,x]=np.nanmean(Zs[y-s:y+s+1,x-s:x+s+1])
 		#Zs[y,x]=0
 
+def tileQuadrant(Zs,xs,ys):
+	nx=len(xs) ; ny=len(ys)
+	# new area is 4x the size, don't duplicate center line?
+	Znew=np.zeros((ny*2-1,nx*2-1)) ; xnew=np.zeros(nx*2-1) ; ynew=np.zeros(ny*2-1)
+	# 1st quadrant: flip data for first half
+	xnew[:nx]=-1*xs[::-1] ; ynew[:ny]=-1*ys[::-1]
+	Znew[:ny,:nx]=Zs[::-1,::-1]
+	# 3rd quadrant: don't flip data for second half
+	xnew[nx-1:]=xs[:] ; ynew[ny-1:]=ys[:]
+	Znew[ny-1:,nx-1:]=Zs[:,:]
+	# 2nd and 4th quadrants are combinations of flipped/unflipped x/y
+	Znew[:ny,nx-1:]=Zs[::-1,:]
+	Znew[ny-1:,:nx]=Zs[:,::-1]
+	return Znew,xnew,ynew
+
+
 def untiltZs(Zs,xs,ys,twist=True):
 	print(np.shape(Zs),np.shape(xs),np.shape(ys))
 	slopesX=np.mean(np.gradient(Zs,xs[1]-xs[0],axis=1),axis=1) # calculate slope of each row. simple mean of slope between each point
@@ -306,16 +339,6 @@ def interp(Zs,x,y,nx,ny=0,method='cubic'):
 	ym,xm=np.meshgrid(ys,xs)
 	interpolated=interp((ym,xm)) # idk how, but somehow through interpolation, our indices get switched. 
 	return interpolated.T,xs,ys
-
-# Z1 should be alpha-channel, Z2 will be heatmapped. you can pass a cmap object or the name of a built-in matplotlib cmap
-def Zalpha(Z1,Z2,cmap='inferno'):
-	ny,nx=np.shape(Z1)
-	Znew=np.zeros((ny,nx,4)) # colormap object: pix-y, pix-x, [R,G,B,A]
-	if isinstance(cmap,str):
-		cmap=eval("matplotlib.cm."+cmap)
-	Znew+=cmap(Z2)
-	Znew[:,:,3]=Z1/np.amax(Z1)
-	return Znew
 
 # NAH, THIS SUCKS. Reds/Blues/Greens go from white to black through the given color. that's not what we really want. 
 def ZNChannel(Z): # pass a 3 x ny x nx matrix. we'll return a RGB object (ny nx 4) where each layer from the original is mapped to a color
@@ -388,11 +411,12 @@ def colorwheel(xs,ys): # pass a 2D matrix of xs and ys between -1 and 1, we'll r
 	#print(Znew)
 	return Z
 
-
-def Z3Channel(Z):
+# Convert a 3,ny,nx matrix into R,Y,B color channels, with correct mixing (R+Y=O, Y+B=G,R+B=V)
+def Z3Channel(Z,alphalims=[0,1]):
 	nl,nx,ny=np.shape(Z)	
 	#Znew=np.zeros((ny,nx,4)) #; red=np.asarray([255,0,0]) ; yellow=np.asarray([255,255,0]) ; blue=np.asarray([0,0,255])
-	Z=[ z/np.amax(z) for z in Z ]
+	maxs=np.amax(Z,axis=(1,2)) ; maxs[maxs==0]=1
+	Z=[ z/m for z,m in zip(Z,maxs) ]
 	xs=[ z*np.cos(t) for z,t in zip(Z,[0,2*np.pi/3,4*np.pi/3])]
 	COMx=np.sum(xs,axis=0)#/np.sum(xs,axis=0)
 	ys=[ z*np.sin(t) for z,t in zip(Z,[0,2*np.pi/3,4*np.pi/3])]
@@ -412,11 +436,17 @@ def Z3Channel(Z):
 	#print("colors",colors)
 	#Znew[:,:,:3]+=colors[:,:,:3]
 	Znew=colorwheel(COMx,COMy)
-	zmax=np.maximum(Z[0],Z[1]) ; zmax=np.maximum(zmax,Z[2])
+	zmax=np.maximum(Z[0],Z[1]) ; zmax=np.maximum(zmax,Z[2])		# base alpha on the most intense color channel
+	#print(np.amax(zmax))
+	zmax/=np.amax(zmax)	# 0-N --> 0-1
+	zmax[zmax<alphalims[0]]=alphalims[0]	# 0-1, but want only 0.25-0.75
+	zmax[zmax>alphalims[1]]=alphalims[1]
+	zmax-=np.amin(zmax) ; zmax/=np.amax(zmax)	# rescale 0.25 to 0 and 0.75 to 1
 	alphas=alpha(zmax)
+
 	#zmax=np.sum(Z,axis=0)
 	#alphas=alpha(zmax/np.amax(zmax))
-	#print("alphas",np.amax(alphas[:,:,3]),np.amin(alphas[:,:,3]))
+	print("alphas",np.amax(alphas[:,:,3]),np.amin(alphas[:,:,3]))
 	Znew[:,:,3]=alphas[:,:,3]#*255
 	#Znew[:,:,3]=255
 	#print(Znew)
@@ -442,73 +472,57 @@ def setContObjs(a,f):
 	global ax,fig ; ax,fig=a,f
 
 
-def contour3D(Intensities,x,y,z,levels='',xlabel="X",ylabel="Y",zlabel="Z",cmap="inferno",alpha=1,projected=False): # BORROWD FROM TDTR_fitting.py > displayContour3D
-	from mpl_toolkits.mplot3d import Axes3D
-	from matplotlib.path import Path
-	import matplotlib.patches as patches
+# Why? np.fft.fft2 assumes index 0 means x=0! not always true, so here's a function which handles all the rolling/etc for you. if x₀ is messed up, the phase will be incorrect (even if the magnitude is correct). also, np.fft.fftfreq returns frequencies "out of order" (positives first) so we apply shift to that too. 
+def fft2(Zs,xs,ys,maxk=np.inf,inverse=False): # expect Zs to have y,x indexing (just like contour function above). which means for non-2D, x is -1, y is -2 indices
+	i=np.argmin(np.absolute(xs)) ; j=np.argmin(np.absolute(ys))
+	Zs=np.roll(np.roll(Zs,-i,axis=-1),-j,axis=-2)			# np.fft.fft2 assumes index 0 means x=0! so we must roll
+	#contour(Zs,np.arange(len(xs)),np.arange(len(ys)))
+	fft=np.fft.fft2(Zs)						
+	dx=xs[1]-xs[0] ; dy=ys[1]-ys[0]					# ℱ(ξ) = ∫ f(x) exp(-i2πξx) dx....
+	fft*=dx*dy							# but numpy does not integrate! it sums! 
+	kxs=np.fft.fftfreq(len(xs),xs[1]-xs[0])
+	kys=np.fft.fftfreq(len(ys),ys[1]-ys[0])
+	i=len(kxs)//2 ; j=len(kys)//2
+	fft=np.roll(np.roll(fft,i,axis=-1),j,axis=-2)			# kx and ky include negative frequencies, so we must unroll! 
+	kxs=np.roll(kxs,i) ; kys=np.roll(kys,j)
+	#from niceplot import plot
+	#plot([np.arange(len(kxs)),np.arange(len(kys))],[kxs,kys])
+	ix=np.arange(len(kxs)) ; iy=np.arange(len(kys))			# I generally prefer masks as [0,0,0,0,1,1,1,1,1,1,0,0,0]
+	ix=ix[kxs>=-maxk]  ; kxs=kxs[kxs>=-maxk]			# for the elements i want to keep, then kept=original[mask==1]
+	ix=ix[kxs<=maxk]  ; kxs=kxs[kxs<=maxk]				# but here, we don't want to make assumptions on the shape.
+	iy=iy[kys>=-maxk]  ; kys=kys[kys>=-maxk]			# if Zs was *always* ny,nx, we could do it, but abEELS often
+	iy=iy[kys<=maxk]  ; kys=kys[kys<=maxk]				# has nLayers,nPts,ny,nx and so on. instead, use np.take
+	fft=np.take(fft,ix,axis=-1)					# which accepts a list of indices and an axis
+	fft=np.take(fft,iy,axis=-2)
 
-	fig = plt.figure()
-	ax = fig.add_subplot(projection = '3d')
+	# WHY CAN WE USE AN FFT TO CALCULATE AN INVERSE FFT??
+	# ℱ(ξ) = ∫ f(x) exp(-i2πξx) dx : https://en.wikipedia.org/wiki/Fourier_transform
+	# ℱ⁻¹[g(x)] := ∫ exp(2πixξ) g(ξ) dξ : https://en.wikipedia.org/wiki/Fourier_inversion_theorem
+	# it's the same expression, but with a negative sign! apply the -x either before or after
+	if inverse:							
+		kxs*=-1 ; kys*=-1					# these are now x and y (user passed kx,ky), so apply negative
+		fft=fft[::-1,::-1] ; kxs=kxs[::-1] ; kys=kys[::-1]	# x,y now descending, so flip all axes
+		# (if we want x to start at zero, we can roll. we assume f(x) is periodic anyway though, so it doesn't really matter)
+		i=np.argmin(np.absolute(kxs)) ; j=np.argmin(np.absolute(kys))
+		fft=np.roll(np.roll(fft,-i,axis=-1),-j,axis=-2)
+		kxs=np.roll(kxs,-i) ; kys=np.roll(kys,-j)
+		# and rolling alone isn't enough. values below 0 must be shifted by length (assumes periodic cell)
+		lx=(kxs[1]-kxs[0])*len(kxs) ; ly=(kys[1]-kys[0])*len(kys)
+		kxs[kxs<0]+=lx ; kys[kys<0]+=ly
+	return fft,kxs,kys
 
-	if len(levels)==0:
-		levels=[ np.mean(Intensities) ]
-	levels=np.asarray(levels)
-	if isinstance(alpha,(int,float)):
-		alpha=[alpha]*len(levels)
-
-	#PLOT CONTOUR PLANES
-	zfact=(max(z)-min(z))/100 #normal strategy is to "flatten" levels by divide by, say, 100, if residuals are between .1 and 5%, we're faking the countours as a 3D surface but only with a height that changes by .001-.05. BUT, if our z scale is already tiny (eg, nanometers or something), this'll be a problem, so we need to further reduce it.
-	for i in range(0,len(z)):
-		if np.amin(Intensities[:,:,i])>=max(levels):
-			continue
-		Z=np.transpose(Intensities[:,:,i]*zfact+z[i])
-		lv=levels*zfact+z[i]
-		#print(lv,alpha)
-		#print(lv,alpha)
-		CS=plt.contour(x, y, Z, levels=lv,alpha=1,cmap=cmap) # a series of 2D contour slices
-		for i,col in enumerate(CS.collections):
-			col.set_alpha(alpha[i])
-		#i=np.where(levels==threshold)[0][0]
-		#if i<len(CS.collections):
-		#	CS.collections[i].set_color('red')
-		#	CS.collections[i].set_alpha(min(6*alpha,1))
-
-	# ax.view_init(elev=elevAzi[0], azim=elevAzi[1])
-
-	if projected:
-		#levels=np.asarray([threshold]) 		# only draw 2.5% contour on the axis planes...
-		lxyz=[x,y,z] ; cxyz="xyz"
-		for transAx in [2,0,1]:									# transpo,meshgrid,plt.cont,zdir 
-			projected=np.transpose(np.amin(residuals,axis=transAx))				# 2	x,y	X,Y,projZ  "z"			
-			xy=[lxyz[i] for i in range(3) if i!=transAx ]					# 0	y,z	projX,Y,Z  "x"
-			XY=np.meshgrid(*xy)								# 1	x,z	X,projY,Z  "y"
-			XY.insert(transAx,projected)							#
-			#XYZ=[ [XY[0],Y,projected] , [projected,X,Y]
-			#print(np.shape(XY))
-			#print(transAx,cxyz[transAx],XY)
-			plt.contour(*XY, levels=levels, colors=["red"], zdir=cxyz[transAx],alpha=0.25)
-			zAxis=[x,y,z][transAx] ; zoff=max(zAxis) ; XY[transAx]+=zoff
-			plt.contour(*XY, levels=levels+zoff, colors=["red"], zdir=cxyz[transAx],alpha=0.25)
-	
-	ax.set_xlabel(xlabel,labelpad=8)
-	ax.set_ylabel(ylabel,labelpad=8)
-	ax.set_zlabel(zlabel,labelpad=8)
-
-	plt.show()
-	return fig,ax
-
+# OLD VERSION, RESTORED FROM U Virginia/Research/Various Code/rivannaProcessing/W_Ansyscompare13/Various Code/niceplot/nicecontour.py
 # numpy FFT assumes index 0 is t=0 or x=0. if that's not the case, your phase will be wrong! here, you pass Z,xs,ys (Z has y,x index ordering just like contour), we roll as appropriate, and then FFT. we return reciprocal space kx,ky too. 
-def fft2(zs,xs,ys,maxk=np.inf):
-	i=np.argmin(np.absolute(xs)) ; 	j=np.argmin(np.absolute(ys))
-	zs=np.roll(np.roll(zs,-j,axis=-2),-i,axis=-1)
-	kx=np.fft.fftfreq(len(xs),xs[1]-xs[0]) ; ky=np.fft.fftfreq(len(ys),ys[1]-ys[0])
-	f=np.fft.fft2(zs)
-	if maxk<np.amax(kx):
-		ix=np.arange(len(kx)) ; ix[kx<-maxk]=-1 ; ix[kx>maxk]=-1 ; ix=ix[ix>=0]
-		iy=np.arange(len(ky)) ; iy[ky<-maxk]=-1 ; iy[ky>maxk]=-1 ; iy=iy[iy>=0]
-		kx=kx[ix] ; ky=ky[iy] ; f=np.take(f,ix,axis=-1) ; f=np.take(f,iy,axis=-2)
-	return f,kx,ky
-
+#def fft2(zs,xs,ys,maxk=np.inf):
+#	i=np.argmin(np.absolute(xs)) ; 	j=np.argmin(np.absolute(ys))
+#	zs=np.roll(np.roll(zs,-j,axis=-2),-i,axis=-1)
+#	kx=np.fft.fftfreq(len(xs),xs[1]-xs[0]) ; ky=np.fft.fftfreq(len(ys),ys[1]-ys[0])
+#	f=np.fft.fft2(zs)
+#	if maxk<np.amax(kx):
+#		ix=np.arange(len(kx)) ; ix[kx<-maxk]=-1 ; ix[kx>maxk]=-1 ; ix=ix[ix>=0]
+#		iy=np.arange(len(ky)) ; iy[ky<-maxk]=-1 ; iy[ky>maxk]=-1 ; iy=iy[iy>=0]
+#		kx=kx[ix] ; ky=ky[iy] ; f=np.take(f,ix,axis=-1) ; f=np.take(f,iy,axis=-2)
+#	return f,kx,ky
 
 
 

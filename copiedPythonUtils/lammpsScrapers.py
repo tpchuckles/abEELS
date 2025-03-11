@@ -5,12 +5,30 @@ from tqdm import tqdm
 def scrapePos(filename):
 	lines=open(filename,'r').readlines()
 	for i,l in enumerate(lines):
-		if len(l.split(" "))==6:
+		numCols=len(l.split(" "))
+		hasNonNumChars=( False in [ c in "0123456789.e- \n" for c in l ])
+		if hasNonNumChars:
+			continue
+		if numCols==6 or numCols==5:
 			break
+	#print("scrapePos: data starts on line",i)
 	data=np.loadtxt(filename,delimiter=" ",skiprows=i)
 	#print(data)
-	pos=data[:,3:] ; types=data[:,2].astype(int)
+	if numCols==5:
+		pos=data[:,2:] ; types=data[:,1].astype(int)
+	else:
+		pos=data[:,3:] ; types=data[:,2].astype(int)
 	return pos,types
+
+def bboxFromPos(filename):
+	lines=open(filename,'r').readlines()
+	bbox=[]
+	for l in lines:
+		if "xlo xhi" in l or "ylo yhi" in l or "zlo zhi" in l:
+			l=l.split()
+			bbox.append([float(l[0]),float(l[1])])
+		if len(bbox)==3:
+			return np.asarray(bbox)
 
 def scrapeLayers(filename):		# # Chunk-averaged data for fix flux_m2 and group all	# comments
 	ts=[] ; Ts=[] ; X=[]		# # Timestep Number-of-chunks Total-count
@@ -225,6 +243,7 @@ def getWrapAndRange(size,axis):
 		wrap[axis]=size ; r=[-1,0,1]
 	return wrap,r
 
+# TODO currently we only handle gamma unskewing, BUT, if we worked in fractional coordinates (unskew before calculating, and i'm sure code exists to calculate the transformation matrix based on all alpha beta gamma) then we wouldn't need skewing in the shifting. 
 def dxyz(pos1,pos2,sx,sy,sz,alpha=90,beta=90,gamma=90): # given two snapshots of positions [[xa,ya,za],[xb,yb,zb],...] x2, don't just do dxyz=xyz1-xyz2. must include wrapping!
 	dxyz_0=pos2-pos1
 	# we use these for wrapping
@@ -309,7 +328,16 @@ def SED(avg,velocities,p_xyz,v_xyz,a,nk=100,bs='',perAtom=False,ks='',keepComple
 	# user should simply call this function multiple times, passing the "bs"
 	# argument with a list of atom indices for us to use
 
-	if isinstance(p_xyz,(int,float)): # 0,1,2 --> x,y,z
+	# TODO NEED VALIDATION OF THESE. CHECK OUT /media/Alexandria/U Virginia/Research/MD/projects/nanotubeBN/ AND COMPARE TO hBN_07
+	if isinstance(p_xyz,str): # "theta" and "radius" are both allowed! we will do polar coordinates! (psuedo-angular momentum)
+		if p_xyz=="theta":
+			xs=np.arctan2(avg[bs,1],avg[bs,0])
+			ks=np.linspace(0,a,nk)	# IF THETA, "a" SHOULD BE NUMBER OF UNIT CELLS AROUND THE CIRCUMFERENCE (previously, system is length L, divided by n, where a=L/n, and ks goes to 2π/a. here, θ goes 0-2π (this is L), so π/(2π/n) --> n
+		elif p_xyz=="radius":
+			xs=np.sqrt(avg[bs,1]**2+avg[bs,0]**2)
+		else:
+			print("ERROR, UNRECOGNIZED STRING PASSED FOR p_xyz",p_xyz,"(try \"theta\" or \"radius\", an axis index, or a vector)")
+	elif isinstance(p_xyz,(int,float)): # 0,1,2 --> x,y,z
 		xs=avg[bs,p_xyz] # a,xyz --> a
 	else:	# [1,0,0],[1,1,0],[1,1,1] and so on
 		# https://math.stackexchange.com/questions/1679701/components-of-velocity-in-the-direction-of-a-vector-i-3j2k
@@ -322,7 +350,14 @@ def SED(avg,velocities,p_xyz,v_xyz,a,nk=100,bs='',perAtom=False,ks='',keepComple
 		xs/=np.linalg.norm(p_xyz)
 
 	# TODO mongo ram usage for rotation step vs simply using a reference to the existing matrix, if velocities is huge, e.g. simulations with a 100000 atoms, e.g. 50x50x5 UC silicon (8 atoms per UC), as required for 110 SED
-	if isinstance(v_xyz,(int,float)):
+	if isinstance(v_xyz,str): # "theta" and "radius" are both allowed! we will do polar coordinates! (psuedo-angular momentum)
+		if v_xyz=="theta":
+			vs=np.arctan2(velocities[:,bs,1],velocities[:,bs,0])
+		elif v_xyz=="radius":
+			vs=np.sqrt(velocities[:,bs,1]**2+velocities[:,bs,0]**2)
+		else:
+			print("ERROR, UNRECOGNIZED STRING PASSED FOR p_xyz",p_xyz,"(try \"theta\" or \"radius\", an axis index, or a vector)")
+	elif isinstance(v_xyz,(int,float)):
 		vs=velocities[:,bs,v_xyz] # t,a,xyz --> t,a
 	else: 
 		# for handling velocities, there's just one more step from above: "flattening" first two axes t,a,xyz --> t*a,x,y,z
@@ -360,38 +395,6 @@ def SED(avg,velocities,p_xyz,v_xyz,a,nk=100,bs='',perAtom=False,ks='',keepComple
 			Zs[:,j]+=np.absolute(integrated)**2
 	return Zs,ks,ws
 
-# angleRange A : 0 to π, useful for evaluating accoustic vs optical modes (0 vs 180° phase difference between atomic basis atoms)
-# angleRange B : -π/2 to π/2, useful for evaluating orbit-like modes (chiral, AOM, 90° phase difference between two degenerate branches)
-# angleRange C : like B, but vectorized
-def SEDphase(Z1,Z2,angleRange="A"):
-	nw,nk=np.shape(Z1) ; Zs=np.zeros((nw,nk))
-	# ALL AT ONCE IS PROBABLY A BIT FASTER, AND YOU DON'T NEED TO MESS WITH THE DOTS AND CROSSES??? unwrapping/folding is more confusing though
-	if angleRange=="C":									#       π/2
-		t1=np.arctan2(Z1.real,Z1.imag)							#   1    |     2 
-		t2=np.arctan2(Z2.real,Z2.imag)							#     .-'|'-.
-		dt=t1-t2 # may have results outside π/2 < θ < π/2, so we gotta wrap those	# 0__/___|___\___π
-		dt[dt>np.pi]-=2*np.pi	# step 1 is to unwrap, but keep quadrant: 3π/2=-π/2	# 2π \   |   /
-		dt[dt<-np.pi]+=2*np.pi								#     `-.|.-'
-		# step 2 is to reflect Q2 and Q3 back to Q1 and Q4				#  4     |     3
-		Q2=np.zeros(dt.shape) ; Q2[dt>np.pi/2]=1 ; dt[Q2==1]*=-1 ; dt[Q2==1]+=np.pi	#       3π/2
-		Q3=np.zeros(dt.shape) ; Q3[dt<-np.pi/2]=1 ; dt[Q3==1]*=-1 ; dt[Q3==1]-=np.pi
-		return dt
-
-	for i in tqdm(range(nw)):
-		for j in range(nk):
-			v1=np.asarray( [ Z1[i,j].real , Z1[i,j].imag ] ) # Re/Im parts are vectors. we want the angle between them
-			v2=np.asarray( [ Z2[i,j].real , Z2[i,j].imag ] )
-			m1=np.sqrt(np.sum(v1**2)) ; m2=np.sqrt(np.sum(v2**2))
-			if angleRange=="A":		# yields angles 0 to π
-				Z=np.dot(v1,v2)/m1/m2	# dot product: 1 if vectors are parallel, zero if vectors are perpendicular. 
-				angle=np.arccos(Z)	# angle between vectors (if using dot). θ=cos⁻¹( (a•b)/|a||b| )
-			elif angleRange=="B": 		# yields angles -π/2 to π/2
-				Z=np.cross(v1,v2)	# cross-product: ±1 is vectors are perpendicular, sign denotes lagging or leading. 
-				Z*=1/m1/m2		# note: cross product scales with magnitude of vectors (as did dot product above)
-				angle=np.arcsin(Z)	# θ=sin⁻¹(...), cos⁻¹ is signless
-			Zs[i,j]=angle
-	return Zs
-
 def addDumpColumn(dumpfile,columnvals,outfile):
 	f1=open(dumpfile,'r')
 	f2=open(outfile,'w')
@@ -414,17 +417,47 @@ def addDumpColumn(dumpfile,columnvals,outfile):
 		f2.write(line)
 
 # save positions (na,xyz) to a positions file. useful for visualizing avg and stuff
-def outToPositionsFile(filename,pos,types,sx,sy,sz,masses):
+def outToPositionsFile(filename,pos,types,masses,a,b,c,alpha=90,beta=90,gamma=90,fractional=False):
+	alpha,beta,gamma = [ v*np.pi/180 for v in [ alpha,beta,gamma ] ]
+	# https://docs.lammps.org/Howto_triclinic.html
+	lx = a                   ;   xy = b*np.cos(gamma)            ; xz = c*np.cos(beta)
+	ly = np.sqrt(b**2-xy**2) ;   yz = (b*c*np.cos(alpha)-xy*xz)/ly ; lz = np.sqrt(c**2-xz**2-yz**2)
+	if fractional: # USER MAY ELECT TO PASS POSITIONS IN FRACTIONAL COORDINATES (NO SKEWNING APPLIED FOR ALPHA/BETA/GAMMA, SO WE SHOULD DO IT FOR THEM
+		print("fractional conversion:",pos[-1])
+		M=np.asarray([[lx,xy,xz],[0,ly,yz],[0,0,lz]])
+		pos=[ np.matmul(M,p) for p in pos ]
+		print("fractional conversion:",pos[-1])
 	import datetime
 	now=datetime.datetime.now()
 	lines=["########### lammpsScapers.py > outToPositionsFile() "+now.strftime("%Y/%m/%d %H:%M:%S")+" ###########"]
 	lines=lines+[str(len(pos))+" atoms","",str(len(masses))+" atom types",""]
-	for s,xyz in zip([sx,sy,sz],["x","y","z"]):
+	for s,xyz in zip([lx,ly,lz],["x","y","z"]):
 		lines.append("0.0 "+str(s)+" "+xyz+"lo "+xyz+"hi")
+	if np.amax(np.absolute([xy,xz,yz]))>1e-5:
+		lines.append(str(xy)+" "+str(xz)+" "+str(yz)+" xy xz yz")
 	lines=lines+["","Masses",""]+[ str(i+1)+" "+str(m) for i,m in enumerate(masses) ]+["","Atoms",""]
-	for t,xyz in zip(types,pos):
-		t=int(t) ; atxyz=[ str(v) for v in [1,t,*xyz] ]
+	for i,(t,xyz) in enumerate(zip(types,pos)):
+		t=int(t) ; atxyz=[ str(v) for v in [i+1,1,t,*xyz] ]
 		lines.append(" ".join(atxyz))
+		#lines[-1]=lines[-1].replace(" -0.0 "," 0.0 ") 
+	with open(filename,'w') as f:
+		for l in lines:
+			f.write(l+"\n")
+
+# positions (nt,na,nxyz) is written to a psuedo-dump file. useful for visualizing avg and stuff
+def outToQdump(filename,pos,types,sx,sy,sz):
+	import datetime
+	now=datetime.datetime.now()
+	lines=[]#"########### lammpsScapers.py > outToPositionsFile() "+now.strftime("%Y/%m/%d %H:%M:%S")+" ###########"]
+	nt,na,nxyz=np.shape(pos)
+	for t in tqdm(range(nt)):
+		lines=lines+["ITEM: TIMESTEP",str(t+1),"ITEM: NUMBER OF ATOMS",str(na),"ITEM: BOX BOUNDS pp pp pp"]
+		for s in [sx,sy,sz]:
+			lines.append("0 "+str(s))
+		lines.append("ITEM: ATOMS id type x y z")
+		for a in range(na):
+			l=[a+1,types[a],*pos[t,a,:]]
+			lines.append(" ".join([str(v) for v in l ]))
 	with open(filename,'w') as f:
 		for l in lines:
 			f.write(l+"\n")
@@ -843,13 +876,16 @@ def filterNeighborsByGroup(neighbors,As,Bs):
 # positions - [nt,na,xyz]
 # potential - a function which can be passed a list of atom's positions [na,xyz] and return the potential energy
 # atomSets - lists of atomIDs to feed into potential. e.g. i,j,k triplets for a 3-body potential
-def calculateInteratomicForces(positions,potential,atomSets,perturbBy=.0001):
-	os.makedirs("calculateInteratomicForces",exist_ok=True)
-	nt=len(positions)
-	nBody=len(atomSets[0])
-	#dxyz=np.zeros((nBody,nBody)) ; dxyz.flat[::nBody+1]=perturbBy
-	for ijk in tqdm(atomSets):
-		for xyz in range(3):
+def calculateInteratomicForces(positions,potential,atomSets,perturbBy=.0001):	#   B     H	Perturb B, assume 
+	os.makedirs("calculateInteratomicForces",exist_ok=True)			#    '-. /.- G	no force on B by
+	nt=len(positions)							#  C----A'.  	C, ergo, Fb=Fba
+	nBody=len(atomSets[0])							#     .' \ '-F	repeat for C-G, 
+	#dxyz=np.zeros((nBody,nBody)) ; dxyz.flat[::nBody+1]=perturbBy		#    D    E	yields pairwise. 
+	for ijk in tqdm(atomSets):						# Don't worry, later, B will be 
+		for xyz in range(3):						# the central atom to capture Fbc etc
+			fileout="calculateInteratomicForces/F"+xyzString+"_"+ijkString+".npy"
+			if os.path.exists(fileout):
+				continue
 			forces=np.zeros((nt,nBody)) # will hold force at each timestep: total on i, then contribution from j,k,etc
 			for t in range(nt):
 				atoms=positions[t,ijk,:]
@@ -861,8 +897,10 @@ def calculateInteratomicForces(positions,potential,atomSets,perturbBy=.0001):
 					forces[t,j]=-(Vi-Vo)/perturbBy			# Fx=-dE/dx. if Vp > Vo, Force is negative!
 			xyzString=["x","y","z"][xyz]
 			ijkString=",".join([ str(j) for j in ijk ])
-			fileout="calculateInteratomicForces/F"+xyzString+"_"+ijkString+".txt"
-			np.savetxt(fileout,forces)
+			#fileout="calculateInteratomicForces/F"+xyzString+"_"+ijkString+".txt"
+			#np.savetxt(fileout,forces)
+
+			np.save(fileout,forces)
 
 def SHF(velocities,As,Bs):
 	forceFiles=glob.glob("calculateInteratomicForces/*")

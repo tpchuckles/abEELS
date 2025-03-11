@@ -6,13 +6,14 @@ from cycler import cycler
 # THESE ARE ALL YOUR USER-CONFIGURABLE SETTINGS.
 # WHAT DEFAULT COLORS AND SYMBOLS DO YOU WANT TO ROTATE THROUGH? WHAT COLORMAP DO YOU WANT INTEGER COLOR VALUES TO REFER TO?
 defCols=['k', 'g', 'b', 'r']
-defMark=['o','^','s','P','d','X','v','+','x'] ; defMark=['o','^','s','P','d','X','v','*','p','D']
+defMark=['o','^','s','P','d','X','v','+','x']
 defaultMarkerSize = 10
 defaultLineWidth = 2
 cycle=cycler(color=defCols*len(defMark))+cycler(marker=defMark*len(defCols)) # https://github.com/matplotlib/cycler/issues/41
 #cmap=matplotlib.cm.inferno
 #cmap=matplotlib.cm.rainbow
 cmap=matplotlib.cm.plasma
+#cmap=matplotlib.cm.hsv
 # WHAT GLOBAL TICK, AXIS, FONT SETTINGS DO YOU WANT?
 params={ 'xtick':{ 'direction':'in', 'top':True , 'bottom':True , 'major.pad':7 }, # (rule #4)
 	'ytick':{ 'direction':'in', 'left':True , 'right':True , 'major.pad':7 },
@@ -101,8 +102,6 @@ def plot( xs, ys, xe='', ye='', markers='', labels='', filename='', multiplot=''
 	if "cmap" in kwargs.keys():
 		global cmap
 		cmap=kwargs["cmap"]
-		if isinstance(cmap,str):
-			cmap=eval("matplotlib.cm."+cmap)
 
 	global axs,frames,fig,markerSize,lineWidth ; axs=[] ; frames=[]
 	lineWidth = kwargs.get("lw", defaultLineWidth) ; markerSize = kwargs.get("ms", defaultMarkerSize);
@@ -288,7 +287,6 @@ def islist(val): # WHY? if val is a numpy array, then isinstance(val,list) will 
 
 # lots of valid options for markers: "k" (black, default in a symbol), "k-" (black line, mpl standard), "k,-" (comma-separated), "tab:blue" (blue, default in a symbol), "tab:blue,-" (blue line), "o" (default in the color, o symbol), "-" (defailt in the color, line symbol)
 def handleMarkers(m):
-	#print("HANDLE MARKERS",m)
 	kw={}
 	#m=markers[i]
 	if isinstance(m,str):
@@ -390,7 +388,20 @@ def invertPlotColors(axs,fig):
 	frame.set_facecolor('black')			# inside area of legend --> black
 	frame.set_edgecolor('white')			# legend border lines --> white
 
-
+# this function returns an extras function! use it to add color-gradient lines (or alpha intensity gradient lines, since matplotlib's alphas arg doesn't accept lists of values). note: if you pass an empty Xs and Ys lists, the plot extents will not be auto-set properly, so you might want to plot the datasets invisibly first (e.g., in white) too. e.g., try "plot([x],[y],markers=['w-'],extras=[addGradientLine(x,y,cs)])" where x,y,cs are single lists of values, with cs being the color. cs can either be a list of values 0-1 (passed to the colormap) or an nx3 or nx4 array (RGB(A) colors)
+def addGradientLine(x,y,cs,nth=1):
+	def extra(axs,fig):
+		from matplotlib.collections import LineCollection
+		points=np.asarray([x,y]).T.reshape(-1,1,2)
+		segments = np.concatenate([points[:-1], points[1:]], axis=1)
+		lc = LineCollection(segments[::nth],linestyle="-",lw=2)
+		if len(np.shape(cs))>1:
+			lc.set(color=cs[::nth])
+		else:
+			lc.set(cmap=cmap)
+			lc.set_array(cs[::nth])
+		axs[0].add_collection(lc)
+	return extra
 
 def saveCSV(xs,ys,ye,xlabel,ylabel,labels,filename):
 	#print("saveCSV","xs",xs,"ys",ys,"ye",ye,"xlabel",xlabel,"ylabel",ylabel,"labels",labels,"filename",filename)
@@ -434,6 +445,7 @@ def readCSV(filename):
 
 # WHY ARE WE CODING UP OUR OWN VERSION OF GAUSSIAN BLUR? (instead of using scipy.ndimage.gaussian_filter1d etc)?
 # I like being able to use the same gaussian function (including gaussian definition of beam radius) used for our thermal experiments (see TDTR_fitting.py and FD3D.py)
+# TODO scipy.ndimage.gaussian_filter can do different blurWidth for each axis, can do 1D 2D etc, and is way way way way way faster than doing our own convolution. we should figure out what the equivalence is and just use that. https://docs.scipy.org/doc/scipy/reference/generated/scipy.ndimage.gaussian_filter.html
 def gaussianBlur(data,blurWidth):
 	if len(data)==2:
 		xs,ys=data ; ND=2 ; from scipy.signal import convolve
