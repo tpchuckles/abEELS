@@ -1041,18 +1041,24 @@ def sliceE(nth=1):
 	kxs=np.load(outDirec+"/kxs.npy")
 	kys=np.load(outDirec+"/kys.npy")
 	os.makedirs(outDirec+"/slices",exist_ok=True)
+	smearOmega=0
+	if os.path.exists(outDirec+"/smearOmega.txt"):
+		smearOmega=float( open(outDirec+"/smearOmega.txt",'r').readlines()[0] )
 
 	chunks=psiFileNames(prefix="ivib")
 	print(chunks)
 	for fs in chunks:
 		psi=np.load(fs[0])
+		if smearOmega>0:
+			from scipy.ndimage import gaussian_filter
+			psi=gaussian_filter(psi,(smearOmega,0,0))
 
 		#radii=np.sqrt(kxs[:,None]**2+kys[None,:]**2)
 		#psi[:,radii<.05]=0
 
 		fo=fs[0].split("/") ; fo.insert(2,"slices") ; fo="/".join(fo) # outputs/inputfilename/ivib.npy --> outputs/inputfilename/slices/ivib.npy
 		for i in tqdm(range(len(ws))):
-			#for i in [50]:
+		#for i in [74]:
 			if i%nth!=0:
 				continue
 			if (maxFreq is not None) and ( ws[i]>maxFreq or ws[i]<-1*maxFreq ):
@@ -1062,8 +1068,8 @@ def sliceE(nth=1):
 			out=np.sum(np.absolute(psi[i1:i2]),axis=0) 	# TRY A ROLLING MEAN A FEW BINS WIDE
 			#out=np.arctan2(np.real(psi[i]),np.imag(psi[i]))
 			out=np.sqrt(np.sqrt(out))
-			#contour(out.T,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(np.round(ws[i],2))+" THz",aspect=1,heatOrContour="pix")#,zlim=zlim,cmap='Spectral')
-			contour(out.T**2,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".svg"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(np.round(ws[i],2))+" THz",aspect=1,heatOrContour="pix",xlim=[-1,1],ylim=[-1,1])#,zlim=zlim,cmap='Spectral')
+			contour(out.T,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+".png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(np.round(ws[i],2))+" THz",aspect=1,heatOrContour="pix")#,zlim=zlim,cmap='Spectral')
+			#contour(out.T**2,kxs,kys,filename=fo.replace(".npy","_e"+str(i)+"_2.png"),xlabel="$\AA$^-1",ylabel="$\AA$^-1",title=str(np.round(ws[i],2))+" THz",aspect=1,heatOrContour="pix")#,xlim=[-1,1],ylim=[-1,1])#,zlim=zlim,cmap='Spectral')
 
 def sliceE2(nth=1):
 	ws=np.load(outDirec+"/ws.npy")
@@ -1102,15 +1108,18 @@ def sliceE2(nth=1):
 #           |  		    the first BZ.
 def loopDispersions():
 	lines=open(outDirec+"/dispersions.txt")
-	global m,xi,yi,xlim,ylim,title,includeNegatives,omegaScaling
+	global m,xi,yi,xlim,ylim,title,includeNegatives,omegaScaling,smearOmega
 	for l in lines:
 		includeNegatives=True ; omegaScaling=False
+		smearOmega=0									# defaulting sequence: 0, smearOmega.txt, dispersions.txt (line in dispersions.txt overrides all)
+		if os.path.exists(outDirec+"/smearOmega.txt"):
+			smearOmega=float( open(outDirec+"/smearOmega.txt",'r').readlines()[0] )
 		l=l.split("#")[0].strip()
 		if len(l)<=10:
 			continue
 		print("loopDispersions: processing line:",l)
 		exec(l,globals())
-		dispersion(m,xi,yi,xlim,ylim,title,includeNegatives,omegaScaling)
+		dispersion(m,xi,yi,xlim,ylim,title,includeNegatives,omegaScaling,smearOmega)
 	# how does this work? copy and past something like below into a "dispersions.txt" file and we'll loop through each line
 	# m=0      ; xi=0   ; yi=2/b ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] ; title="Xo" 	# AlN, Xo
 	# m=0      ; xi=0   ; yi=0   ; xlim=[0,6/a] ; ylim=[-np.inf,np.inf] ; title="Xc" 	# AlN, Xc
@@ -1118,7 +1127,8 @@ def loopDispersions():
 	# m=np.inf ; xi=2/a ; yi=0   ; xlim=[0,6/a] ; ylim=[0,6/b]          ; title="Mo" 	# AlN, Xc
 
 loadedChunks={}
-def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None,includeNegatives=True,omegaScaling=0):
+def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None,includeNegatives=True,omegaScaling=0,smearOmega=0):
+
 	os.makedirs(outDirec+"/dispersions",exist_ok=True)
 	
 	#global a,b,c,beamAxis
@@ -1221,6 +1231,9 @@ def dispersion(m=None,xi=None,yi=None,xlim=None,ylim=None,title=None,includeNega
 
 		#print(np.amax(sliced),np.amin(sliced))
 		sliced=np.absolute(sliced)
+		if smearOmega>0:
+			from scipy.ndimage import gaussian_filter
+			sliced=gaussian_filter(sliced,(0,smearOmega))
 		sliced[sliced==0]=np.amin(sliced[sliced>0])
 		#print(np.amax(sliced),np.amin(sliced))
 		contour(np.log(diff).T,kxs,kys,filename=outDirec+"/dispersions/"+title+"_disp_linescan"+filelabel+".png",xlabel="$\AA$^-1",ylabel="$\AA$^-1",title="dispersion masked diffraction image",overplot=[overplot],heatOrContour="pix")
